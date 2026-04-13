@@ -13,6 +13,7 @@ void main() async {
 
   // 🔥 OPEN BOX BEFORE RUNNING APP
   await Hive.openBox<Note>('notesBox');
+  await Hive.openBox('settings');
 
   runApp(const MyApp());
 }

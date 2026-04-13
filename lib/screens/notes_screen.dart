@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 import '../models/note_model.dart';
 import 'edit_note_screen.dart';
 import 'edit_checklist_screen.dart';
+import 'vault_lock_screen.dart';
 
 enum DrawerSection { notes, reminders, labels, archive, settings, help }
 
@@ -29,10 +30,27 @@ class _NotesScreenState extends State<NotesScreen> {
     const Color(0xFF90CAF9),
   ];
 
+  bool _isVaultOpening = false;
+
   @override
   void initState() {
     super.initState();
     box = Hive.box<Note>('notesBox');
+  }
+
+  void _openVault() {
+    if (_isVaultOpening) return;
+
+    _isVaultOpening = true;
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => const VaultLockScreen(),
+      ),
+    ).then((_) {
+      _isVaultOpening = false;
+    });
   }
 
   void openNote({Note? note}) {
@@ -73,7 +91,6 @@ class _NotesScreenState extends State<NotesScreen> {
     );
   }
 
-  // ARCHIVE
   void toggleArchive(Note note) {
     final isNowArchived = !note.isArchived;
 
@@ -91,7 +108,6 @@ class _NotesScreenState extends State<NotesScreen> {
       );
   }
 
-  // 🔥 REMINDER (NEW)
   void toggleReminder(Note note) {
     final isNowReminder = !note.isReminder;
 
@@ -137,7 +153,6 @@ class _NotesScreenState extends State<NotesScreen> {
                       decoration: const InputDecoration(hintText: "Title"),
                     ),
                     const SizedBox(height: 10),
-
                     ...List.generate(items.length, (index) {
                       return Row(
                         children: [
@@ -155,7 +170,6 @@ class _NotesScreenState extends State<NotesScreen> {
                         ],
                       );
                     }),
-
                     TextButton(
                       onPressed: () {
                         setModalState(() {
@@ -169,7 +183,6 @@ class _NotesScreenState extends State<NotesScreen> {
                       },
                       child: const Text("+ Add item"),
                     ),
-
                     ElevatedButton(
                       onPressed: () {
                         final List<Map> list = [];
@@ -279,7 +292,6 @@ class _NotesScreenState extends State<NotesScreen> {
                     overflow: TextOverflow.ellipsis,
                   ),
                   const SizedBox(height: 6),
-
                   Expanded(
                     child: n.isChecklist && n.checklist != null
                         ? Column(
@@ -321,7 +333,6 @@ class _NotesScreenState extends State<NotesScreen> {
                             overflow: TextOverflow.ellipsis,
                           ),
                   ),
-
                   Row(
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
@@ -343,7 +354,6 @@ class _NotesScreenState extends State<NotesScreen> {
                       ),
                     ],
                   ),
-
                   Text(
                     DateFormat.yMMMd().format(n.createdAt),
                     style: const TextStyle(fontSize: 10),
@@ -391,7 +401,22 @@ class _NotesScreenState extends State<NotesScreen> {
           onChanged: (v) => setState(() => searchQuery = v),
         ),
       ),
-      body: _buildBody(),
+
+      // ✅ FIXED HERE
+      body: GestureDetector(
+        behavior: HitTestBehavior.translucent, 
+        onScaleUpdate: (details) {
+          if (details.scale < 0.7 && details.pointerCount == 2) {
+            _openVault();
+          }
+        },
+        child: SizedBox( // 🔥 REQUIRED
+          width: double.infinity,
+          height: double.infinity,
+        child: _buildBody(),
+      ),
+      ),
+
       floatingActionButton: FloatingActionButton(
         onPressed: () {
           showModalBottomSheet(
