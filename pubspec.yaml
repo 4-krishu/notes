@@ -23,6 +23,7 @@ dependencies:
 
   # MEDIA PICKER (for vault later)
   image_picker: ^1.0.7
+  file_picker: ^8.3.7
 
   # PATH (file storage)
   path_provider: ^2.1.2
