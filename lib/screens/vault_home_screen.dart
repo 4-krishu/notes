@@ -10,10 +10,18 @@ import 'package:sensors_plus/sensors_plus.dart';
 import '../security/vault_crypto.dart';
 import '../security/vault_prefs.dart';
 import '../security/vault_storage.dart';
+import '../security/vault_trash.dart';
 import 'album_screen.dart';
 import 'vault_lock_screen.dart';
 import 'vault_settings_screen.dart';
 import 'vault_theme.dart';
+import 'vault_trash_screen.dart';
+
+class _SearchHit {
+  final String album;
+  final String fileName;
+  _SearchHit(this.album, this.fileName);
+}
 
 class VaultHomeScreen extends StatefulWidget {
   /// Vault password, kept in memory only. Used to encrypt/decrypt files.
@@ -48,6 +56,13 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
   Map<String, Uint8List> covers = {};
   bool loading = true;
 
+  // --- search ---
+  final TextEditingController _searchController =
+      TextEditingController();
+  String _query = '';
+  List<_SearchHit> _searchHits = [];
+  bool _searching = false;
+
   // --- auto-lock ---
   int? _backgroundedAtMs;
 
@@ -75,6 +90,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
       ),
     );
     WidgetsBinding.instance.addObserver(this);
+    _searchController.addListener(_onSearchChanged);
     _subscribeShake();
     _refresh();
   }
@@ -82,6 +98,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _searchController.dispose();
     _shakeSub?.cancel();
     super.dispose();
   }
@@ -153,6 +170,22 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
   Future<void> _refresh() async {
     if (mounted) setState(() => loading = true);
 
+    // Trash auto-cleanup: permanently delete items older than 30 days.
+    try {
+      final removed = await VaultTrash.purgeExpired(
+        await _storage.trashDir(),
+      );
+      if (removed > 0 && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              "Trash auto-emptied: $removed file(s) older than 30 days deleted",
+            ),
+          ),
+        );
+      }
+    } catch (_) {}
+
     final counts = <String, int>{};
     final newCovers = <String, Uint8List>{};
 
@@ -199,6 +232,133 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
   }
 
   void _saveAlbums() => settingsBox.put(_storage.albumsKey, albums);
+
+  // ------------------------------------------------------------------
+  // Search across file names and album names, grouped by album.
+  // ------------------------------------------------------------------
+
+  void _onSearchChanged() {
+    final q = _searchController.text.trim().toLowerCase();
+    if (q == _query) return;
+    _query = q;
+    if (q.isEmpty) {
+      setState(() {
+        _searchHits = [];
+        _searching = false;
+      });
+      return;
+    }
+    _runSearch(q);
+  }
+
+  Future<void> _runSearch(String q) async {
+    setState(() => _searching = true);
+    final hits = <_SearchHit>[];
+    for (final name in albums) {
+      final dir = await _storage.albumDir(name);
+      if (!await dir.exists()) continue;
+      await for (final e in dir.list()) {
+        if (e is! File) continue;
+        final fName = e.path.split('/').last;
+        if (!fName.endsWith('.enc') ||
+            fName.endsWith('.thumb.enc')) {
+          continue;
+        }
+        final display =
+            fName.substring(0, fName.length - '.enc'.length);
+        if (display.toLowerCase().contains(q) ||
+            name.toLowerCase().contains(q)) {
+          hits.add(_SearchHit(name, display));
+        }
+      }
+      if (_query != q) return; // a newer query superseded this one
+    }
+    if (!mounted || _query != q) return;
+    setState(() {
+      _searchHits = hits;
+      _searching = false;
+    });
+  }
+
+  Widget _buildSearchBar() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      child: TextField(
+        controller: _searchController,
+        style: const TextStyle(color: VaultTheme.textPrimary),
+        decoration: VaultTheme.inputDecoration("Search files")
+            .copyWith(
+          prefixIcon: const Icon(Icons.search,
+              color: VaultTheme.textSecondary),
+          suffixIcon: _query.isEmpty
+              ? null
+              : IconButton(
+                  icon: const Icon(Icons.clear,
+                      color: VaultTheme.textSecondary),
+                  onPressed: () => _searchController.clear(),
+                ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSearchResults() {
+    if (_searching) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_searchHits.isEmpty) {
+      return Center(
+        child: Text(
+          'No results for "$_query"',
+          style:
+              const TextStyle(color: VaultTheme.textSecondary),
+        ),
+      );
+    }
+    final grouped = <String, List<_SearchHit>>{};
+    for (final h in _searchHits) {
+      grouped.putIfAbsent(h.album, () => []).add(h);
+    }
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        for (final album in grouped.keys) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(4, 12, 4, 4),
+            child: Text(
+              album,
+              style: const TextStyle(
+                color: VaultTheme.textSecondary,
+                fontWeight: FontWeight.bold,
+                fontSize: 13,
+              ),
+            ),
+          ),
+          for (final h in grouped[album]!)
+            Container(
+              margin: const EdgeInsets.only(bottom: 6),
+              decoration: VaultTheme.cardDecoration(),
+              child: ListTile(
+                leading: const Icon(
+                    Icons.insert_drive_file_outlined,
+                    color: VaultTheme.accent),
+                title: Text(
+                  h.fileName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      color: VaultTheme.textPrimary),
+                ),
+                onTap: () {
+                  _searchController.clear();
+                  _openAlbum(h.album);
+                },
+              ),
+            ),
+        ],
+      ],
+    );
+  }
 
   // ------------------------------------------------------------------
   // Albums: create / rename / delete
@@ -318,6 +478,8 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
     );
   }
 
+  /// Deleting an album moves its files to the trash (recoverable for
+  /// 30 days) instead of permanently deleting them.
   void _deleteAlbum(String name) {
     final count = itemCounts[name] ?? 0;
     showDialog(
@@ -331,7 +493,8 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
         content: Text(
           count == 0
               ? 'Delete "$name"?'
-              : 'Delete "$name" and its $count file(s)? This cannot be undone.',
+              : 'Delete "$name"? Its $count file(s) will be moved '
+                  'to the trash.',
           style: const TextStyle(color: VaultTheme.textSecondary),
         ),
         actions: [
@@ -345,6 +508,20 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
               try {
                 final dir = await _storage.albumDir(name);
                 if (await dir.exists()) {
+                  final trashDir = await _storage.trashDir();
+                  final files = await dir
+                      .list()
+                      .where((e) =>
+                          e is File &&
+                          e.path.endsWith('.enc') &&
+                          !e.path.endsWith('.thumb.enc'))
+                      .toList();
+                  await VaultTrash.moveFilesToTrash(
+                    encPaths:
+                        files.map((e) => e.path).toList(),
+                    trashDir: trashDir,
+                    albumName: name,
+                  );
                   await dir.delete(recursive: true);
                 }
               } catch (_) {
@@ -415,6 +592,15 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
           decoy: widget.decoy,
           onPasswordChanged: (np) => setState(() => _password = np),
         ),
+      ),
+    ).then((_) => _refresh());
+  }
+
+  void _openTrash() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => VaultTrashScreen(storage: _storage),
       ),
     ).then((_) => _refresh());
   }
@@ -570,6 +756,8 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
 
   @override
   Widget build(BuildContext context) {
+    final searching = _query.isNotEmpty;
+
     return Scaffold(
       backgroundColor: VaultTheme.background,
       appBar: AppBar(
@@ -606,9 +794,21 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
                 color: VaultTheme.textPrimary),
             color: VaultTheme.surface,
             onSelected: (v) {
-              if (v == 'settings') _openSettings();
+              if (v == 'settings') {
+                _openSettings();
+              } else if (v == 'trash') {
+                _openTrash();
+              }
             },
             itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: 'trash',
+                child: Text(
+                  "Trash bin",
+                  style:
+                      TextStyle(color: VaultTheme.textPrimary),
+                ),
+              ),
               PopupMenuItem(
                 value: 'settings',
                 child: Text(
@@ -629,9 +829,18 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
       ),
       body: loading
           ? const Center(child: CircularProgressIndicator())
-          : albums.isEmpty
-              ? _buildEmpty()
-              : _buildGrid(),
+          : Column(
+              children: [
+                _buildSearchBar(),
+                Expanded(
+                  child: searching
+                      ? _buildSearchResults()
+                      : albums.isEmpty
+                          ? _buildEmpty()
+                          : _buildGrid(),
+                ),
+              ],
+            ),
       floatingActionButton: FloatingActionButton(
         backgroundColor: VaultTheme.accent,
         foregroundColor: Colors.white,

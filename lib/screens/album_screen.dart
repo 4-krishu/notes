@@ -12,7 +12,9 @@ import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 
 import '../security/vault_crypto.dart';
+import '../security/vault_prefs.dart';
 import '../security/vault_storage.dart';
+import '../security/vault_trash.dart';
 import 'vault_theme.dart';
 
 /// One vault item. The grid only ever holds the small thumbnail bytes;
@@ -24,6 +26,8 @@ class _VaultFile {
   final String ext; // original extension, e.g. ".jpg"
   final bool isVideo;
   final bool isImage;
+  final int sizeBytes; // encrypted size on disk (approx. plain size)
+  bool isFavorite;
   Uint8List? thumbBytes; // decrypted thumbnail (null until loaded)
 
   _VaultFile({
@@ -32,6 +36,8 @@ class _VaultFile {
     required this.ext,
     required this.isVideo,
     required this.isImage,
+    required this.sizeBytes,
+    this.isFavorite = false,
     this.thumbBytes,
   });
 
@@ -68,8 +74,9 @@ class _AlbumScreenState extends State<AlbumScreen> {
 
   bool selectionMode = false;
   bool loading = true;
+  bool _showFavoritesOnly = false;
 
-  /// newest | oldest | name
+  /// newest | oldest | name | size
   String _sortMode = 'newest';
 
   late final String _salt;
@@ -104,6 +111,19 @@ class _AlbumScreenState extends State<AlbumScreen> {
     _sortMode = Hive.box('settings')
         .get(_storage.sortKey, defaultValue: 'newest') as String;
     _loadMedia();
+  }
+
+  /// (mediaIndex, file) pairs visible under the current filter.
+  /// Selection indexes always refer to [media], so filtering never
+  /// breaks selection, delete or move.
+  List<MapEntry<int, _VaultFile>> get _visible {
+    final out = <MapEntry<int, _VaultFile>>[];
+    for (var i = 0; i < media.length; i++) {
+      if (!_showFavoritesOnly || media[i].isFavorite) {
+        out.add(MapEntry(i, media[i]));
+      }
+    }
+    return out;
   }
 
   Future<String> _getVaultPath() async {
@@ -266,6 +286,9 @@ class _AlbumScreenState extends State<AlbumScreen> {
           .map((f) => f.path)
           .toSet();
 
+      final favIds =
+          VaultPrefs.getStringList(VaultPrefs.favorites).toSet();
+
       final loaded = <_VaultFile>[];
       for (final file in fullFiles) {
         final fileName = file.path.split('/').last;
@@ -274,6 +297,11 @@ class _AlbumScreenState extends State<AlbumScreen> {
         final ext = _extOf(fileName);
         final tp =
             '${file.path.substring(0, file.path.length - '.enc'.length)}.thumb.enc';
+
+        int size = 0;
+        try {
+          size = await file.length();
+        } catch (_) {}
 
         Uint8List? thumbBytes;
         if (thumbPaths.contains(tp)) {
@@ -294,6 +322,8 @@ class _AlbumScreenState extends State<AlbumScreen> {
           ext: ext,
           isVideo: _videoExts.contains(ext),
           isImage: _imageExts.contains(ext),
+          sizeBytes: size,
+          isFavorite: favIds.contains(_storage.favId(fileName)),
           thumbBytes: thumbBytes,
         ));
       }
@@ -323,6 +353,9 @@ class _AlbumScreenState extends State<AlbumScreen> {
       case 'name':
         media.sort((a, b) =>
             a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+        break;
+      case 'size':
+        media.sort((a, b) => b.sizeBytes.compareTo(a.sizeBytes));
         break;
       default: // newest
         media.sort((a, b) => b.path.compareTo(a.path));
@@ -357,7 +390,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
   }
 
   // ------------------------------------------------------------------
-  // Selection: select/deselect all, delete, move
+  // Selection: select/deselect all, favorite, delete, move
   // ------------------------------------------------------------------
 
   void _toggleSelection(int index) {
@@ -378,19 +411,47 @@ class _AlbumScreenState extends State<AlbumScreen> {
 
   /// Tapping the select-all icon again deselects everything.
   void _toggleSelectAll() {
+    final visible = _visible;
     setState(() {
-      if (selectedIndexes.length == media.length &&
-          media.isNotEmpty) {
-        selectedIndexes.clear();
-        selectionMode = false;
+      final visibleIndexes =
+          visible.map((e) => e.key).toSet();
+      final allVisibleSelected =
+          visibleIndexes.isNotEmpty &&
+          visibleIndexes.every(selectedIndexes.contains);
+      if (allVisibleSelected) {
+        selectedIndexes.removeAll(visibleIndexes);
+        if (selectedIndexes.isEmpty) selectionMode = false;
       } else {
-        selectedIndexes =
-            Set.from(List.generate(media.length, (i) => i));
+        selectedIndexes.addAll(visibleIndexes);
         selectionMode = true;
       }
     });
   }
 
+  /// Stars (or unstars) the selected files. Favorites survive album moves
+  /// because the id is the encrypted file name, not its location.
+  void _toggleFavoriteSelected() {
+    if (selectedIndexes.isEmpty) return;
+    final favs =
+        VaultPrefs.getStringList(VaultPrefs.favorites).toSet();
+    final targets =
+        selectedIndexes.map((i) => media[i]).toList();
+    final anyUnfav = targets.any((t) => !t.isFavorite);
+    setState(() {
+      for (final t in targets) {
+        final id = _storage.favId(t.path.split('/').last);
+        t.isFavorite = anyUnfav;
+        if (anyUnfav) {
+          favs.add(id);
+        } else {
+          favs.remove(id);
+        }
+      }
+    });
+    VaultPrefs.setStringList(VaultPrefs.favorites, favs.toList());
+  }
+
+  /// Deletes go to the trash bin: recoverable for 30 days.
   void _deleteSelected() {
     if (selectedIndexes.isEmpty) return;
 
@@ -400,12 +461,12 @@ class _AlbumScreenState extends State<AlbumScreen> {
         return AlertDialog(
           backgroundColor: VaultTheme.surface,
           title: const Text(
-            "Delete files?",
+            "Move to trash?",
             style: TextStyle(color: VaultTheme.textPrimary),
           ),
           content: Text(
-            "Delete ${selectedIndexes.length} file(s)? "
-            "This cannot be undone.",
+            "Move ${selectedIndexes.length} file(s) to the trash? "
+            "They stay recoverable for 30 days.",
             style:
                 const TextStyle(color: VaultTheme.textSecondary),
           ),
@@ -419,13 +480,16 @@ class _AlbumScreenState extends State<AlbumScreen> {
                 Navigator.pop(dialogContext);
                 final targets =
                     selectedIndexes.map((i) => media[i]).toList();
-                for (final item in targets) {
-                  try {
-                    await File(item.path).delete();
-                  } catch (_) {}
-                  try {
-                    await File(item.thumbPath).delete();
-                  } catch (_) {}
+                try {
+                  final trashDir = await _storage.trashDir();
+                  await VaultTrash.moveFilesToTrash(
+                    encPaths:
+                        targets.map((t) => t.path).toList(),
+                    trashDir: trashDir,
+                    albumName: widget.albumName,
+                  );
+                } catch (_) {
+                  // Best effort; refresh below regardless.
                 }
                 if (mounted) {
                   setState(() {
@@ -433,10 +497,14 @@ class _AlbumScreenState extends State<AlbumScreen> {
                     selectedIndexes.clear();
                     selectionMode = false;
                   });
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                        content: Text("Moved to trash")),
+                  );
                 }
               },
               child: const Text(
-                "Delete",
+                "Move to trash",
                 style: TextStyle(color: VaultTheme.danger),
               ),
             ),
@@ -565,8 +633,8 @@ class _AlbumScreenState extends State<AlbumScreen> {
   // Opening files
   // ------------------------------------------------------------------
 
-  void _openItem(int index) {
-    final item = media[index];
+  void _openItem(int mediaIndex) {
+    final item = media[mediaIndex];
     if (item.isDocument) {
       _openDocument(item);
     } else {
@@ -575,9 +643,11 @@ class _AlbumScreenState extends State<AlbumScreen> {
         MaterialPageRoute(
           builder: (_) => FullScreenViewer(
             items: media,
-            initialIndex: index,
+            initialIndex: mediaIndex,
             password: widget.password,
             salt: _salt,
+            storage: _storage,
+            albumName: widget.albumName,
           ),
         ),
       );
@@ -674,6 +744,13 @@ class _AlbumScreenState extends State<AlbumScreen> {
           fit: StackFit.expand,
           children: [
             content,
+            if (file.isFavorite && !selected)
+              const Positioned(
+                top: 6,
+                left: 6,
+                child: Icon(Icons.star,
+                    size: 18, color: VaultTheme.accent),
+              ),
             if (selected)
               Container(
                 color: VaultTheme.accent.withOpacity(0.25),
@@ -692,10 +769,56 @@ class _AlbumScreenState extends State<AlbumScreen> {
     );
   }
 
+  Widget _buildFilterChips() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+      child: Row(
+        children: [
+          ChoiceChip(
+            label: const Text("All"),
+            selected: !_showFavoritesOnly,
+            selectedColor: VaultTheme.accentSoft,
+            backgroundColor: VaultTheme.surface,
+            labelStyle: TextStyle(
+              color: _showFavoritesOnly
+                  ? VaultTheme.textSecondary
+                  : VaultTheme.textPrimary,
+            ),
+            onSelected: (_) =>
+                setState(() => _showFavoritesOnly = false),
+          ),
+          const SizedBox(width: 8),
+          ChoiceChip(
+            label: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.star, size: 16),
+                SizedBox(width: 4),
+                Text("Favorites"),
+              ],
+            ),
+            selected: _showFavoritesOnly,
+            selectedColor: VaultTheme.accentSoft,
+            backgroundColor: VaultTheme.surface,
+            labelStyle: TextStyle(
+              color: _showFavoritesOnly
+                  ? VaultTheme.textPrimary
+                  : VaultTheme.textSecondary,
+            ),
+            onSelected: (_) =>
+                setState(() => _showFavoritesOnly = true),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final allSelected =
-        media.isNotEmpty && selectedIndexes.length == media.length;
+    final visible = _visible;
+    final visibleIndexes = visible.map((e) => e.key).toSet();
+    final allVisibleSelected = visibleIndexes.isNotEmpty &&
+        visibleIndexes.every(selectedIndexes.contains);
 
     return Scaffold(
       backgroundColor: VaultTheme.background,
@@ -716,11 +839,18 @@ class _AlbumScreenState extends State<AlbumScreen> {
         actions: [
           if (selectionMode) ...[
             IconButton(
-              icon: Icon(
-                  allSelected ? Icons.deselect : Icons.select_all),
-              tooltip:
-                  allSelected ? "Deselect all" : "Select all",
+              icon: Icon(allVisibleSelected
+                  ? Icons.deselect
+                  : Icons.select_all),
+              tooltip: allVisibleSelected
+                  ? "Deselect all"
+                  : "Select all",
               onPressed: _toggleSelectAll,
+            ),
+            IconButton(
+              icon: const Icon(Icons.star_outline),
+              tooltip: "Favorite",
+              onPressed: _toggleFavoriteSelected,
             ),
             IconButton(
               icon: const Icon(Icons.drive_file_move_outlined),
@@ -743,6 +873,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
                 _sortMenuItem('newest', "Newest first"),
                 _sortMenuItem('oldest', "Oldest first"),
                 _sortMenuItem('name', "Name"),
+                _sortMenuItem('size', "Size"),
               ],
             ),
         ],
@@ -784,32 +915,57 @@ class _AlbumScreenState extends State<AlbumScreen> {
                     ],
                   ),
                 )
-              : GridView.builder(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: media.length,
-                  gridDelegate:
-                      const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 3,
-                    crossAxisSpacing: 8,
-                    mainAxisSpacing: 8,
-                  ),
-                  itemBuilder: (_, i) {
-                    final file = media[i];
-                    final selected =
-                        selectedIndexes.contains(i);
+              : Column(
+                  children: [
+                    _buildFilterChips(),
+                    Expanded(
+                      child: visible.isEmpty
+                          ? const Center(
+                              child: Text(
+                                "No favorites yet — long-press a file, then tap the star",
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                    color:
+                                        VaultTheme.textSecondary),
+                              ),
+                            )
+                          : GridView.builder(
+                              padding:
+                                  const EdgeInsets.all(12),
+                              itemCount: visible.length,
+                              gridDelegate:
+                                  const SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: 3,
+                                crossAxisSpacing: 8,
+                                mainAxisSpacing: 8,
+                              ),
+                              itemBuilder: (_, i) {
+                                final entry = visible[i];
+                                final mediaIndex = entry.key;
+                                final file = entry.value;
+                                final selected =
+                                    selectedIndexes.contains(
+                                        mediaIndex);
 
-                    return GestureDetector(
-                      onTap: () {
-                        if (selectionMode) {
-                          _toggleSelection(i);
-                        } else {
-                          _openItem(i);
-                        }
-                      },
-                      onLongPress: () => _toggleSelection(i),
-                      child: _buildTile(file, selected),
-                    );
-                  },
+                                return GestureDetector(
+                                  onTap: () {
+                                    if (selectionMode) {
+                                      _toggleSelection(
+                                          mediaIndex);
+                                    } else {
+                                      _openItem(mediaIndex);
+                                    }
+                                  },
+                                  onLongPress: () =>
+                                      _toggleSelection(
+                                          mediaIndex),
+                                  child: _buildTile(
+                                      file, selected),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
                 ),
       floatingActionButton: FloatingActionButton(
         backgroundColor: VaultTheme.accent,
@@ -829,6 +985,8 @@ class FullScreenViewer extends StatefulWidget {
   final int initialIndex;
   final String password;
   final String salt;
+  final VaultStorage storage;
+  final String albumName;
 
   const FullScreenViewer({
     super.key,
@@ -836,6 +994,8 @@ class FullScreenViewer extends StatefulWidget {
     required this.initialIndex,
     required this.password,
     required this.salt,
+    required this.storage,
+    required this.albumName,
   });
 
   @override
@@ -1090,17 +1250,18 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
     );
   }
 
+  /// Deletes go to the trash bin: recoverable for 30 days.
   void _deleteCurrent() {
     final item = widget.items[_current];
     showDialog(
       context: context,
       builder: (dialogContext) => AlertDialog(
         backgroundColor: VaultTheme.surface,
-        title: const Text('Delete this file?',
+        title: const Text('Move to trash?',
             style:
                 TextStyle(color: VaultTheme.textPrimary)),
         content: const Text(
-          'This cannot be undone.',
+          'This file will stay recoverable for 30 days.',
           style: TextStyle(color: VaultTheme.textSecondary),
         ),
         actions: [
@@ -1112,11 +1273,16 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
             onPressed: () async {
               Navigator.pop(dialogContext);
               try {
-                await File(item.path).delete();
-              } catch (_) {}
-              try {
-                await File(item.thumbPath).delete();
-              } catch (_) {}
+                final trashDir =
+                    await widget.storage.trashDir();
+                await VaultTrash.moveFilesToTrash(
+                  encPaths: [item.path],
+                  trashDir: trashDir,
+                  albumName: widget.albumName,
+                );
+              } catch (_) {
+                // Best effort; still drop it from the list.
+              }
               widget.items.removeAt(_current);
               if (!mounted) return;
               if (widget.items.isEmpty) {
@@ -1131,7 +1297,7 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
               _loadCurrent();
               if (needsJump) controller.jumpToPage(_current);
             },
-            child: const Text('Delete',
+            child: const Text('Move to trash',
                 style: TextStyle(color: VaultTheme.danger)),
           ),
         ],
