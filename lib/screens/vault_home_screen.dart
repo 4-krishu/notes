@@ -13,6 +13,7 @@ import '../security/vault_storage.dart';
 import '../security/vault_trash.dart';
 import 'album_screen.dart';
 import 'vault_lock_screen.dart';
+import 'vault_notes_screen.dart';
 import 'vault_settings_screen.dart';
 import 'vault_theme.dart';
 import 'vault_trash_screen.dart';
@@ -605,6 +606,18 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
     ).then((_) => _refresh());
   }
 
+  void _openNotes() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => VaultNotesScreen(
+          password: _password,
+          decoy: widget.decoy,
+        ),
+      ),
+    );
+  }
+
   // ------------------------------------------------------------------
   // UI
   // ------------------------------------------------------------------
@@ -798,9 +811,19 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
                 _openSettings();
               } else if (v == 'trash') {
                 _openTrash();
+              } else if (v == 'notes') {
+                _openNotes();
               }
             },
             itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: 'notes',
+                child: Text(
+                  "Vault notes",
+                  style:
+                      TextStyle(color: VaultTheme.textPrimary),
+                ),
+              ),
               PopupMenuItem(
                 value: 'trash',
                 child: Text(

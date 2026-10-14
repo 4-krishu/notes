@@ -54,6 +54,9 @@ dependencies:
   # PANIC SHAKE-TO-LOCK (vault)
   sensors_plus: ^6.1.1
 
+  # VIDEO THUMBNAILS (vault grid)
+  video_thumbnail: ^0.5.3
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

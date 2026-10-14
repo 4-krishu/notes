@@ -10,6 +10,7 @@ import 'package:image/image.dart' as img;
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
+import 'package:video_thumbnail/video_thumbnail.dart';
 
 import '../security/vault_crypto.dart';
 import '../security/vault_prefs.dart';
@@ -155,6 +156,29 @@ class _AlbumScreenState extends State<AlbumScreen> {
     }
   }
 
+  /// Extracts a small JPEG thumbnail from a video file on disk.
+  /// Returns null when the platform can't produce one.
+  Future<Uint8List?> _makeVideoThumbnail(String videoPath) async {
+    try {
+      final tmp = await getTemporaryDirectory();
+      final thumbPath = await VideoThumbnail.thumbnailFile(
+        video: videoPath,
+        thumbnailPath: tmp.path,
+        imageFormat: ImageFormat.JPEG,
+        maxHeight: 300,
+        quality: 70,
+      );
+      if (thumbPath == null) return null;
+      final bytes = await File(thumbPath).readAsBytes();
+      try {
+        await File(thumbPath).delete();
+      } catch (_) {}
+      return bytes;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Imports files: encrypts a copy into the vault (plus an encrypted
   /// thumbnail for images), verifies the round-trip, and only then deletes
   /// the original so it no longer sits in the gallery.
@@ -226,6 +250,18 @@ class _AlbumScreenState extends State<AlbumScreen> {
           if (thumb != null) {
             final encThumb = VaultCrypto.encryptBytes(
                 thumb, widget.password, _salt);
+            await File('$vaultPath/$base.thumb.enc')
+                .writeAsBytes(encThumb, flush: true);
+          }
+        }
+
+        // Thumbnail for videos: extracted from the original file before
+        // it is deleted below.
+        if (_videoExts.contains(ext)) {
+          final vthumb = await _makeVideoThumbnail(original.path);
+          if (vthumb != null) {
+            final encThumb = VaultCrypto.encryptBytes(
+                vthumb, widget.password, _salt);
             await File('$vaultPath/$base.thumb.enc')
                 .writeAsBytes(encThumb, flush: true);
           }
@@ -370,12 +406,29 @@ class _AlbumScreenState extends State<AlbumScreen> {
 
   Future<void> _generateMissingThumbs() async {
     for (final item in media) {
-      if (!item.isImage || item.thumbBytes != null) continue;
+      if (item.thumbBytes != null) continue;
+      if (!item.isImage && !item.isVideo) continue;
       try {
-        final data = await File(item.path).readAsBytes();
-        final plain =
-            VaultCrypto.decryptBytes(data, widget.password, _salt);
-        final thumb = _makeThumbnail(plain);
+        Uint8List? thumb;
+        if (item.isImage) {
+          final data = await File(item.path).readAsBytes();
+          final plain = VaultCrypto.decryptBytes(
+              data, widget.password, _salt);
+          thumb = _makeThumbnail(plain);
+        } else {
+          // Video: decrypt to a temp file, extract a frame, clean up.
+          final data = await File(item.path).readAsBytes();
+          final plain = VaultCrypto.decryptBytes(
+              data, widget.password, _salt);
+          final tmp = await getTemporaryDirectory();
+          final tmpPath =
+              '${tmp.path}/vault_vthumb_${DateTime.now().millisecondsSinceEpoch}${item.ext}';
+          await File(tmpPath).writeAsBytes(plain, flush: true);
+          thumb = await _makeVideoThumbnail(tmpPath);
+          try {
+            await File(tmpPath).delete();
+          } catch (_) {}
+        }
         if (thumb == null) continue;
         final encThumb = VaultCrypto.encryptBytes(
             thumb, widget.password, _salt);
@@ -680,7 +733,22 @@ class _AlbumScreenState extends State<AlbumScreen> {
 
   Widget _buildTile(_VaultFile file, bool selected) {
     Widget content;
-    if (file.isVideo) {
+    if (file.isVideo && file.thumbBytes != null) {
+      content = Stack(
+        fit: StackFit.expand,
+        children: [
+          Image.memory(file.thumbBytes!, fit: BoxFit.cover),
+          const Align(
+            alignment: Alignment.bottomRight,
+            child: Padding(
+              padding: EdgeInsets.all(6),
+              child: Icon(Icons.play_circle_filled,
+                  size: 22, color: VaultTheme.accent),
+            ),
+          ),
+        ],
+      );
+    } else if (file.isVideo) {
       content = Container(
         color: VaultTheme.surfaceLight,
         child: const Stack(
