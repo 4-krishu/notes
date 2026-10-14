@@ -64,9 +64,6 @@ class VaultBackup {
     }
 
     final zipBytes = ZipEncoder().encode(archive);
-    if (zipBytes == null) {
-      throw const FormatException('Could not create zip archive');
-    }
     final encrypted = VaultCrypto.encryptBytes(
       Uint8List.fromList(zipBytes),
       password,
