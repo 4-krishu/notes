@@ -103,10 +103,7 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
   // Blocking progress + text-prompt helpers
   // ------------------------------------------------------------------
 
-  bool _busy = false;
-
   void _showBusy(String label) {
-    _busy = true;
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -130,7 +127,6 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
   }
 
   void _hideBusy() {
-    _busy = false;
     if (mounted) {
       Navigator.pop(context);
     }
