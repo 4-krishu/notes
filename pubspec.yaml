@@ -44,6 +44,16 @@ dependencies:
   # IMAGE THUMBNAILS (vault grid)
   image: ^4.2.0
 
+  # BIOMETRIC UNLOCK (vault lock screen)
+  local_auth: ^2.1.7
+  flutter_secure_storage: ^9.2.2
+
+  # INTRUDER SELFIE (vault lock screen)
+  camera: ^0.11.1
+
+  # PANIC SHAKE-TO-LOCK (vault)
+  sensors_plus: ^6.1.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

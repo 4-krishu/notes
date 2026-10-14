@@ -15,6 +15,9 @@ import 'package:hive/hive.dart';
 /// - Vault files are AES-256 encrypted. The key is SHA-256(salt + password),
 ///   a fresh random IV is used per file, and the IV is prepended to the
 ///   ciphertext on disk: [ iv (16 bytes) | ciphertext ].
+/// - Intruder selfies are encrypted with a key derived from the salt only
+///   (the vault password is unknown at capture time), so they are excluded
+///   from password changes.
 class VaultCrypto {
   static const String passwordHashKey = 'vault_password_hash';
   static const String answerHashKey = 'vault_answer_hash';
@@ -52,17 +55,42 @@ class VaultCrypto {
     );
   }
 
+  /// Key used for intruder-selfie photos. Derived from the salt only, since
+  /// the vault password is unknown when a selfie is captured.
+  static Uint8List intruderKey(String salt) {
+    return Uint8List.fromList(
+      sha256.convert(utf8.encode('$salt::intruder')).bytes,
+    );
+  }
+
+  /// Encrypts [plainBytes] with a raw 32-byte [key].
+  /// Returns [ iv (16 bytes) | ciphertext ].
+  static Uint8List encryptWithKey(Uint8List plainBytes, Uint8List key) {
+    final k = enc.Key(key);
+    final iv = enc.IV.fromSecureRandom(16);
+    final encrypter = enc.Encrypter(enc.AES(k));
+    final encrypted = encrypter.encryptBytes(plainBytes, iv: iv);
+    return Uint8List.fromList([...iv.bytes, ...encrypted.bytes]);
+  }
+
+  /// Decrypts data produced by [encryptWithKey].
+  static Uint8List decryptWithKey(Uint8List data, Uint8List key) {
+    if (data.length < 17) {
+      throw const FormatException('Not a vault file');
+    }
+    final iv = enc.IV(Uint8List.fromList(data.sublist(0, 16)));
+    final cipher = enc.Encrypted(Uint8List.fromList(data.sublist(16)));
+    final encrypter = enc.Encrypter(enc.AES(enc.Key(key)));
+    return Uint8List.fromList(encrypter.decryptBytes(cipher, iv: iv));
+  }
+
   /// Encrypts [plainBytes]. Returns [ iv (16 bytes) | ciphertext ].
   static Uint8List encryptBytes(
     Uint8List plainBytes,
     String password,
     String salt,
   ) {
-    final key = enc.Key(_aesKey(password, salt));
-    final iv = enc.IV.fromSecureRandom(16);
-    final encrypter = enc.Encrypter(enc.AES(key));
-    final encrypted = encrypter.encryptBytes(plainBytes, iv: iv);
-    return Uint8List.fromList([...iv.bytes, ...encrypted.bytes]);
+    return encryptWithKey(plainBytes, _aesKey(password, salt));
   }
 
   /// Decrypts data produced by [encryptBytes].
@@ -74,14 +102,7 @@ class VaultCrypto {
     String password,
     String salt,
   ) {
-    if (data.length < 17) {
-      throw const FormatException('Not a vault file');
-    }
-    final iv = enc.IV(Uint8List.fromList(data.sublist(0, 16)));
-    final cipher = enc.Encrypted(Uint8List.fromList(data.sublist(16)));
-    final key = enc.Key(_aesKey(password, salt));
-    final encrypter = enc.Encrypter(enc.AES(key));
-    return Uint8List.fromList(encrypter.decryptBytes(cipher, iv: iv));
+    return decryptWithKey(data, _aesKey(password, salt));
   }
 
   /// Compares two byte lists. Used to verify encrypt/decrypt round-trips.
@@ -94,12 +115,12 @@ class VaultCrypto {
     return diff == 0;
   }
 
-  /// Re-encrypts every `.enc` file under [vaultRoot] from [oldPassword] to
-  /// [newPassword].
+  /// Re-encrypts every password-encrypted `.enc` file under [vaultRoot]
+  /// from [oldPassword] to [newPassword], one file at a time (memory stays
+  /// bounded no matter how many files the vault holds).
   ///
-  /// Re-encrypts every `.enc` file under [vaultRoot] from [oldPassword] to
-  /// [newPassword], one file at a time (memory stays bounded no matter how
-  /// many files the vault holds).
+  /// Files under `.intruder/` are skipped: they are encrypted with the
+  /// salt-derived intruder key, not the vault password.
   ///
   /// Atomic-ish: each file is re-encrypted and verified into a temporary
   /// `.new` file first. Only after ALL files succeed are the temp files
@@ -119,7 +140,11 @@ class VaultCrypto {
     final files = <File>[];
     if (await root.exists()) {
       await for (final e in root.list(recursive: true)) {
-        if (e is File && e.path.endsWith('.enc')) files.add(e);
+        if (e is File &&
+            e.path.endsWith('.enc') &&
+            !e.path.contains('/.intruder/')) {
+          files.add(e);
+        }
       }
     }
 
