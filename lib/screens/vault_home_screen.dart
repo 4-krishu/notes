@@ -33,14 +33,6 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
   bool loading = true;
 
   static const String _albumsKey = 'vault_albums';
-  static const List<String> _imageExts = [
-    '.jpg',
-    '.jpeg',
-    '.png',
-    '.gif',
-    '.webp',
-    '.bmp',
-  ];
 
   @override
   void initState() {
@@ -68,17 +60,6 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
     return '${dir.path}/vault';
   }
 
-  String _extOf(String fileName) {
-    // Filename format: <millis>_<n>.<ext>.enc
-    var name = fileName;
-    if (name.endsWith('.enc')) {
-      name = name.substring(0, name.length - '.enc'.length);
-    }
-    final dot = name.lastIndexOf('.');
-    if (dot == -1) return '';
-    return name.substring(dot).toLowerCase();
-  }
-
   Future<void> _refresh() async {
     if (mounted) setState(() => loading = true);
 
@@ -89,25 +70,28 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
       final folder = await _albumDir(name);
       if (await folder.exists()) {
         final entries = await folder.list().toList();
-        final encFiles = entries
-            .whereType<File>()
-            .where((f) => f.path.endsWith('.enc'))
+        final files = entries.whereType<File>().toList();
+        // Count real items only: thumbnails (*.thumb.enc) are not items.
+        final itemFiles = files
+            .where((f) =>
+                f.path.endsWith('.enc') &&
+                !f.path.endsWith('.thumb.enc'))
             .toList();
-        counts[name] = encFiles.length;
+        counts[name] = itemFiles.length;
 
-        // Cover: first image file, decrypted.
-        for (final f in encFiles) {
-          if (_imageExts.contains(_extOf(f.path.split('/').last))) {
-            try {
-              newCovers[name] = VaultCrypto.decryptBytes(
-                await f.readAsBytes(),
-                _password,
-                _salt,
-              );
-            } catch (_) {
-              // Skip unreadable files.
-            }
-            break;
+        // Cover: first available thumbnail (small, cheap to decrypt).
+        final thumbs = files
+            .where((f) => f.path.endsWith('.thumb.enc'))
+            .toList();
+        if (thumbs.isNotEmpty) {
+          try {
+            newCovers[name] = VaultCrypto.decryptBytes(
+              await thumbs.first.readAsBytes(),
+              _password,
+              _salt,
+            );
+          } catch (_) {
+            // Skip unreadable files.
           }
         }
       } else {

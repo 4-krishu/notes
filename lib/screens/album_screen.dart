@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:hive/hive.dart';
+import 'package:image/image.dart' as img;
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
@@ -11,15 +12,16 @@ import 'package:video_player/video_player.dart';
 import '../security/vault_crypto.dart';
 import 'vault_theme.dart';
 
-/// One decrypted vault item. Bytes are decrypted on load; the file on disk
-/// stays encrypted at all times.
+/// One vault item. The grid only ever holds the small thumbnail bytes;
+/// the full file is decrypted on demand when opened. This keeps memory
+/// bounded no matter how many photos the album holds.
 class _VaultFile {
-  final String path; // encrypted .enc file on disk
-  final String name; // original filename without the .enc suffix
+  final String path; // encrypted full file: <base>.enc
+  final String name; // display name without the .enc suffix
   final String ext; // original extension, e.g. ".jpg"
   final bool isVideo;
   final bool isImage;
-  final Uint8List bytes; // decrypted bytes (memory only)
+  Uint8List? thumbBytes; // decrypted thumbnail (null until loaded)
 
   _VaultFile({
     required this.path,
@@ -27,10 +29,14 @@ class _VaultFile {
     required this.ext,
     required this.isVideo,
     required this.isImage,
-    required this.bytes,
+    this.thumbBytes,
   });
 
   bool get isDocument => !isVideo && !isImage;
+
+  /// "<dir>/X.jpg.enc" -> "<dir>/X.jpg.thumb.enc"
+  String get thumbPath =>
+      '${path.substring(0, path.length - '.enc'.length)}.thumb.enc';
 }
 
 class AlbumScreen extends StatefulWidget {
@@ -57,6 +63,10 @@ class _AlbumScreenState extends State<AlbumScreen> {
   bool loading = true;
 
   late final String _salt;
+
+  /// Files larger than this are skipped on import: encrypting them would
+  /// need several times their size in RAM at once.
+  static const int _maxImportBytes = 250 * 1024 * 1024;
 
   static const List<String> _videoExts = [
     '.mp4',
@@ -102,8 +112,22 @@ class _AlbumScreenState extends State<AlbumScreen> {
     return name.substring(dot).toLowerCase();
   }
 
-  /// Imports files: encrypts a copy into the vault, verifies the round-trip,
-  /// and only then deletes the original so it no longer sits in the gallery.
+  /// Builds a small JPEG thumbnail from full image bytes.
+  /// Returns null if the bytes aren't a decodable image.
+  Uint8List? _makeThumbnail(Uint8List plain) {
+    try {
+      final decoded = img.decodeImage(plain);
+      if (decoded == null) return null;
+      final thumb = img.copyResize(decoded, width: 400);
+      return Uint8List.fromList(img.encodeJpg(thumb, quality: 70));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Imports files: encrypts a copy into the vault (plus an encrypted
+  /// thumbnail for images), verifies the round-trip, and only then deletes
+  /// the original so it no longer sits in the gallery.
   Future<void> _pickMedia() async {
     final result = await FilePicker.platform.pickFiles(
       allowMultiple: true,
@@ -111,21 +135,72 @@ class _AlbumScreenState extends State<AlbumScreen> {
     );
 
     if (result == null) return;
+    final picked =
+        result.files.where((f) => f.path != null).toList();
+    if (picked.isEmpty) return;
 
     final vaultPath = await _getVaultPath();
+
+    // Progress dialog: importing hundreds of files takes a while and
+    // the app must not look frozen.
+    int done = 0;
+    int skippedLarge = 0;
+    StateSetter? updateDialog;
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            updateDialog = setDialogState;
+            return AlertDialog(
+              backgroundColor: VaultTheme.surface,
+              content: Row(
+                children: [
+                  const CircularProgressIndicator(),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Text(
+                      "Importing $done of ${picked.length}...",
+                      style: const TextStyle(
+                          color: VaultTheme.textPrimary),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      );
+    }
+
     var counter = 0;
-
-    for (final picked in result.files) {
-      if (picked.path == null) continue;
-      final original = File(picked.path!);
-
+    for (final f in picked) {
       try {
-        final ext = _extOf(picked.name);
-        final name =
-            '${DateTime.now().millisecondsSinceEpoch}_${counter++}$ext.enc';
-        final destPath = '$vaultPath/$name';
+        final original = File(f.path!);
+        if (await original.length() > _maxImportBytes) {
+          skippedLarge++;
+          continue;
+        }
+
+        final ext = _extOf(f.name);
+        final base =
+            '${DateTime.now().millisecondsSinceEpoch}_${counter++}$ext';
+        final destPath = '$vaultPath/$base.enc';
 
         final plain = await original.readAsBytes();
+
+        // Thumbnail for images (stored encrypted alongside).
+        if (_imageExts.contains(ext)) {
+          final thumb = _makeThumbnail(plain);
+          if (thumb != null) {
+            final encThumb = VaultCrypto.encryptBytes(
+                thumb, widget.password, _salt);
+            await File('$vaultPath/$base.thumb.enc')
+                .writeAsBytes(encThumb, flush: true);
+          }
+        }
+
         final encrypted =
             VaultCrypto.encryptBytes(plain, widget.password, _salt);
         await File(destPath).writeAsBytes(encrypted, flush: true);
@@ -142,16 +217,24 @@ class _AlbumScreenState extends State<AlbumScreen> {
         }
 
         await original.delete();
-      } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Could not import a file: $e')),
-          );
-        }
+      } catch (_) {
+        // Skip broken files; the rest still import.
+      } finally {
+        done++;
+        updateDialog?.call(() {});
       }
     }
 
+    if (mounted) Navigator.pop(context); // close progress dialog
     await _loadMedia();
+    if (skippedLarge > 0 && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+              "$skippedLarge file(s) skipped (over 250 MB)"),
+        ),
+      );
+    }
   }
 
   Future<void> _loadMedia() async {
@@ -160,33 +243,50 @@ class _AlbumScreenState extends State<AlbumScreen> {
       final vaultPath = await _getVaultPath();
       final dir = Directory(vaultPath);
       final entries = await dir.list().toList();
-      final files = entries
-          .whereType<File>()
-          .where((f) => f.path.endsWith('.enc'))
+      final allFiles = entries.whereType<File>().toList();
+
+      final fullFiles = allFiles
+          .where((f) =>
+              f.path.endsWith('.enc') &&
+              !f.path.endsWith('.thumb.enc'))
           .toList()
         ..sort((a, b) => b.path.compareTo(a.path)); // newest first
 
+      final thumbPaths = allFiles
+          .where((f) => f.path.endsWith('.thumb.enc'))
+          .map((f) => f.path)
+          .toSet();
+
       final loaded = <_VaultFile>[];
-      for (final file in files) {
-        try {
-          final data = await file.readAsBytes();
-          final bytes =
-              VaultCrypto.decryptBytes(data, widget.password, _salt);
-          final fileName = file.path.split('/').last;
-          final name = fileName.substring(
-              0, fileName.length - '.enc'.length);
-          final ext = _extOf(fileName);
-          loaded.add(_VaultFile(
-            path: file.path,
-            name: name,
-            ext: ext,
-            isVideo: _videoExts.contains(ext),
-            isImage: _imageExts.contains(ext),
-            bytes: bytes,
-          ));
-        } catch (_) {
-          // Skip files that fail to decrypt (corrupt or foreign files).
+      for (final file in fullFiles) {
+        final fileName = file.path.split('/').last;
+        final name =
+            fileName.substring(0, fileName.length - '.enc'.length);
+        final ext = _extOf(fileName);
+        final tp =
+            '${file.path.substring(0, file.path.length - '.enc'.length)}.thumb.enc';
+
+        Uint8List? thumbBytes;
+        if (thumbPaths.contains(tp)) {
+          try {
+            thumbBytes = VaultCrypto.decryptBytes(
+              await File(tp).readAsBytes(),
+              widget.password,
+              _salt,
+            );
+          } catch (_) {
+            // Corrupt thumbnail; will be regenerated below.
+          }
         }
+
+        loaded.add(_VaultFile(
+          path: file.path,
+          name: name,
+          ext: ext,
+          isVideo: _videoExts.contains(ext),
+          isImage: _imageExts.contains(ext),
+          thumbBytes: thumbBytes,
+        ));
       }
 
       if (mounted) {
@@ -195,13 +295,38 @@ class _AlbumScreenState extends State<AlbumScreen> {
           loading = false;
         });
       }
+
+      // Files imported before thumbnails existed get theirs generated
+      // in the background, one at a time (bounded memory).
+      _generateMissingThumbs();
     } catch (_) {
       if (mounted) setState(() => loading = false);
     }
   }
 
+  Future<void> _generateMissingThumbs() async {
+    for (final item in media) {
+      if (!item.isImage || item.thumbBytes != null) continue;
+      try {
+        final data = await File(item.path).readAsBytes();
+        final plain =
+            VaultCrypto.decryptBytes(data, widget.password, _salt);
+        final thumb = _makeThumbnail(plain);
+        if (thumb == null) continue;
+        final encThumb = VaultCrypto.encryptBytes(
+            thumb, widget.password, _salt);
+        await File(item.thumbPath)
+            .writeAsBytes(encThumb, flush: true);
+        item.thumbBytes = thumb;
+        if (mounted) setState(() {});
+      } catch (_) {
+        // Skip files that fail; tile keeps its placeholder.
+      }
+    }
+  }
+
   // ------------------------------------------------------------------
-  // Selection: delete / move
+  // Selection: select/deselect all, delete, move
   // ------------------------------------------------------------------
 
   void _toggleSelection(int index) {
@@ -220,12 +345,18 @@ class _AlbumScreenState extends State<AlbumScreen> {
     });
   }
 
-  void _selectAll() {
+  /// Tapping the select-all icon again deselects everything.
+  void _toggleSelectAll() {
     setState(() {
-      selectedIndexes = Set.from(
-        List.generate(media.length, (i) => i),
-      );
-      selectionMode = true;
+      if (selectedIndexes.length == media.length &&
+          media.isNotEmpty) {
+        selectedIndexes.clear();
+        selectionMode = false;
+      } else {
+        selectedIndexes =
+            Set.from(List.generate(media.length, (i) => i));
+        selectionMode = true;
+      }
     });
   }
 
@@ -260,9 +391,10 @@ class _AlbumScreenState extends State<AlbumScreen> {
                 for (final item in targets) {
                   try {
                     await File(item.path).delete();
-                  } catch (_) {
-                    // Already gone; continue with the rest.
-                  }
+                  } catch (_) {}
+                  try {
+                    await File(item.thumbPath).delete();
+                  } catch (_) {}
                 }
                 if (mounted) {
                   setState(() {
@@ -345,6 +477,13 @@ class _AlbumScreenState extends State<AlbumScreen> {
                             item.path.split('/').last;
                         await File(item.path).rename(
                             '${destDir.path}/$fileName');
+                        final thumbFile = File(item.thumbPath);
+                        if (await thumbFile.exists()) {
+                          final thumbName =
+                              '${fileName.substring(0, fileName.length - '.enc'.length)}.thumb.enc';
+                          await thumbFile.rename(
+                              '${destDir.path}/$thumbName');
+                        }
                       } catch (_) {
                         // Continue with the rest.
                       }
@@ -356,8 +495,6 @@ class _AlbumScreenState extends State<AlbumScreen> {
                         selectedIndexes.clear();
                         selectionMode = false;
                       });
-                    }
-                    if (mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(
                         SnackBar(
                           content: Text(
@@ -388,8 +525,10 @@ class _AlbumScreenState extends State<AlbumScreen> {
         context,
         MaterialPageRoute(
           builder: (_) => FullScreenViewer(
-            media: media,
+            items: media,
             initialIndex: index,
+            password: widget.password,
+            salt: _salt,
           ),
         ),
       );
@@ -402,7 +541,10 @@ class _AlbumScreenState extends State<AlbumScreen> {
       final tmp = await getTemporaryDirectory();
       final path =
           '${tmp.path}/vault_doc_${DateTime.now().millisecondsSinceEpoch}${item.ext}';
-      await File(path).writeAsBytes(item.bytes, flush: true);
+      final data = await File(item.path).readAsBytes();
+      final plain =
+          VaultCrypto.decryptBytes(data, widget.password, _salt);
+      await File(path).writeAsBytes(plain, flush: true);
       await OpenFilex.open(path);
     } catch (e) {
       if (mounted) {
@@ -436,8 +578,15 @@ class _AlbumScreenState extends State<AlbumScreen> {
           ],
         ),
       );
+    } else if (file.thumbBytes != null) {
+      content = Image.memory(file.thumbBytes!, fit: BoxFit.cover);
     } else if (file.isImage) {
-      content = Image.memory(file.bytes, fit: BoxFit.cover);
+      // Thumbnail still generating in the background.
+      content = Container(
+        color: VaultTheme.surfaceLight,
+        child: const Icon(Icons.image_outlined,
+            size: 32, color: VaultTheme.textSecondary),
+      );
     } else {
       content = Container(
         color: VaultTheme.surfaceLight,
@@ -496,6 +645,9 @@ class _AlbumScreenState extends State<AlbumScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final allSelected =
+        media.isNotEmpty && selectedIndexes.length == media.length;
+
     return Scaffold(
       backgroundColor: VaultTheme.background,
       appBar: AppBar(
@@ -515,9 +667,11 @@ class _AlbumScreenState extends State<AlbumScreen> {
         actions: [
           if (selectionMode) ...[
             IconButton(
-              icon: const Icon(Icons.select_all),
-              tooltip: "Select all",
-              onPressed: _selectAll,
+              icon: Icon(
+                  allSelected ? Icons.deselect : Icons.select_all),
+              tooltip:
+                  allSelected ? "Deselect all" : "Select all",
+              onPressed: _toggleSelectAll,
             ),
             IconButton(
               icon: const Icon(Icons.drive_file_move_outlined),
@@ -606,16 +760,21 @@ class _AlbumScreenState extends State<AlbumScreen> {
   }
 }
 
-/// Full-screen viewer: images from memory, videos decrypted to a temporary
-/// file and played with video_player. The temp file is deleted on close.
+/// Full-screen viewer. The full file is decrypted on demand for the
+/// currently visible page only; images show from memory, videos via a
+/// temporary file that is deleted on close.
 class FullScreenViewer extends StatefulWidget {
-  final List<_VaultFile> media;
+  final List<_VaultFile> items;
   final int initialIndex;
+  final String password;
+  final String salt;
 
   const FullScreenViewer({
     super.key,
-    required this.media,
+    required this.items,
     required this.initialIndex,
+    required this.password,
+    required this.salt,
   });
 
   @override
@@ -628,31 +787,61 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
   String? _tempVideoPath;
   int _current = 0;
 
+  Uint8List? _fullBytes;
+  bool _loadingFull = true;
+  String? _loadError;
+
   @override
   void initState() {
     super.initState();
     _current = widget.initialIndex;
     controller = PageController(initialPage: _current);
-    _maybeInitVideo(_current);
+    _loadCurrent();
   }
 
-  Future<void> _maybeInitVideo(int index) async {
+  Future<void> _loadCurrent() async {
+    if (mounted) {
+      setState(() {
+        _loadingFull = true;
+        _fullBytes = null;
+        _loadError = null;
+      });
+    }
     await _disposeVideo();
 
-    final item = widget.media[index];
-    if (!item.isVideo) return;
+    try {
+      final item = widget.items[_current];
+      final data = await File(item.path).readAsBytes();
+      final plain = VaultCrypto.decryptBytes(
+          data, widget.password, widget.salt);
+      if (!mounted) return;
 
-    final tmp = await getTemporaryDirectory();
-    final ext = item.ext.isEmpty ? '.mp4' : item.ext;
-    final path =
-        '${tmp.path}/vault_play_${DateTime.now().millisecondsSinceEpoch}$ext';
-    await File(path).writeAsBytes(item.bytes, flush: true);
-    _tempVideoPath = path;
-
-    _videoController = VideoPlayerController.file(File(path));
-    await _videoController!.initialize();
-    if (mounted) setState(() {});
-    await _videoController!.play();
+      if (item.isVideo) {
+        final tmp = await getTemporaryDirectory();
+        final ext = item.ext.isEmpty ? '.mp4' : item.ext;
+        final path =
+            '${tmp.path}/vault_play_${DateTime.now().millisecondsSinceEpoch}$ext';
+        await File(path).writeAsBytes(plain, flush: true);
+        _tempVideoPath = path;
+        _videoController = VideoPlayerController.file(File(path));
+        await _videoController!.initialize();
+        if (!mounted) return;
+        setState(() => _loadingFull = false);
+        await _videoController!.play();
+      } else {
+        setState(() {
+          _fullBytes = plain;
+          _loadingFull = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loadingFull = false;
+          _loadError = "Couldn't open this file";
+        });
+      }
+    }
   }
 
   Future<void> _disposeVideo() async {
@@ -685,66 +874,81 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
       ),
       body: PageView.builder(
         controller: controller,
-        itemCount: widget.media.length,
+        itemCount: widget.items.length,
         onPageChanged: (i) {
-          setState(() => _current = i);
-          _maybeInitVideo(i);
+          _current = i;
+          _loadCurrent();
         },
         itemBuilder: (_, i) {
-          final item = widget.media[i];
+          if (i != _current) {
+            // Keep off-screen pages cheap.
+            return const SizedBox.shrink();
+          }
 
-          if (item.isDocument) {
+          if (_loadingFull) {
             return const Center(
-              child: Text(
-                "Preview not available",
-                style: TextStyle(color: Colors.white70),
-              ),
-            );
+                child: CircularProgressIndicator());
           }
 
-          if (!item.isVideo) {
-            return Center(child: Image.memory(item.bytes));
-          }
-
-          if (_videoController != null &&
-              _videoController!.value.isInitialized &&
-              i == _current) {
+          if (_loadError != null) {
             return Center(
-              child: AspectRatio(
-                aspectRatio: _videoController!.value.aspectRatio,
-                child: Stack(
-                  alignment: Alignment.bottomCenter,
-                  children: [
-                    VideoPlayer(_videoController!),
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 16),
-                      child: IconButton(
-                        icon: Icon(
-                          _videoController!.value.isPlaying
-                              ? Icons.pause_circle_filled
-                              : Icons.play_circle_filled,
-                          color: Colors.white,
-                          size: 48,
-                        ),
-                        onPressed: () {
-                          setState(() {
-                            if (_videoController!
-                                .value.isPlaying) {
-                              _videoController!.pause();
-                            } else {
-                              _videoController!.play();
-                            }
-                          });
-                        },
-                      ),
-                    ),
-                  ],
-                ),
+              child: Text(
+                _loadError!,
+                style: const TextStyle(color: Colors.white70),
               ),
             );
           }
 
-          return const Center(child: CircularProgressIndicator());
+          final item = widget.items[i];
+
+          if (item.isVideo) {
+            if (_videoController != null &&
+                _videoController!.value.isInitialized) {
+              return Center(
+                child: AspectRatio(
+                  aspectRatio:
+                      _videoController!.value.aspectRatio,
+                  child: Stack(
+                    alignment: Alignment.bottomCenter,
+                    children: [
+                      VideoPlayer(_videoController!),
+                      Padding(
+                        padding:
+                            const EdgeInsets.only(bottom: 16),
+                        child: IconButton(
+                          icon: Icon(
+                            _videoController!.value.isPlaying
+                                ? Icons.pause_circle_filled
+                                : Icons.play_circle_filled,
+                            color: Colors.white,
+                            size: 48,
+                          ),
+                          onPressed: () {
+                            setState(() {
+                              if (_videoController!
+                                  .value.isPlaying) {
+                                _videoController!.pause();
+                              } else {
+                                _videoController!.play();
+                              }
+                            });
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+            return const Center(
+                child: CircularProgressIndicator());
+          }
+
+          return Center(
+            child: _fullBytes != null
+                ? Image.memory(_fullBytes!)
+                : const SizedBox.shrink(),
+          );
         },
       ),
     );

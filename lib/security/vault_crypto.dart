@@ -97,10 +97,15 @@ class VaultCrypto {
   /// Re-encrypts every `.enc` file under [vaultRoot] from [oldPassword] to
   /// [newPassword].
   ///
-  /// Two-phase, so a wrong password or corrupt file aborts BEFORE anything
-  /// is overwritten: first ALL files are decrypted with the old password
-  /// (throws on failure), then each file is re-encrypted with the new
-  /// password, verified, and only then written back.
+  /// Re-encrypts every `.enc` file under [vaultRoot] from [oldPassword] to
+  /// [newPassword], one file at a time (memory stays bounded no matter how
+  /// many files the vault holds).
+  ///
+  /// Atomic-ish: each file is re-encrypted and verified into a temporary
+  /// `.new` file first. Only after ALL files succeed are the temp files
+  /// renamed over the originals. On any failure the temp files are deleted
+  /// and the originals (plus the old password hash) are untouched, so a
+  /// wrong password or corrupt file aborts safely.
   ///
   /// The caller must update the stored password hash only after this
   /// completes without throwing.
@@ -118,20 +123,43 @@ class VaultCrypto {
       }
     }
 
-    // Phase 1: decrypt everything with the OLD password.
-    final decrypted = <File, Uint8List>{};
-    for (final f in files) {
-      decrypted[f] = decryptBytes(await f.readAsBytes(), oldPassword, salt);
-    }
-
-    // Phase 2: re-encrypt with the NEW password, verify, overwrite.
-    for (final entry in decrypted.entries) {
-      final encrypted = encryptBytes(entry.value, newPassword, salt);
-      final check = decryptBytes(encrypted, newPassword, salt);
-      if (!bytesEqual(check, entry.value)) {
-        throw const FormatException('Re-encryption verification failed');
+    final staged = <File>[];
+    try {
+      for (final f in files) {
+        // Decrypt with the OLD password (throws on wrong password ->
+        // abort before anything is staged).
+        final plain = decryptBytes(
+          await f.readAsBytes(),
+          oldPassword,
+          salt,
+        );
+        final encrypted = encryptBytes(plain, newPassword, salt);
+        final check = decryptBytes(encrypted, newPassword, salt);
+        if (!bytesEqual(check, plain)) {
+          throw const FormatException(
+              'Re-encryption verification failed');
+        }
+        final tmp = File('${f.path}.new');
+        await tmp.writeAsBytes(encrypted, flush: true);
+        staged.add(tmp);
+        // plain/encrypted/check go out of scope here -> memory is freed
+        // before the next file.
       }
-      await entry.key.writeAsBytes(encrypted, flush: true);
+
+      // All verified: swap temp files over the originals.
+      for (final tmp in staged) {
+        final origPath =
+            tmp.path.substring(0, tmp.path.length - '.new'.length);
+        await tmp.rename(origPath);
+      }
+    } catch (_) {
+      // Roll back: delete staged temp files, originals untouched.
+      for (final tmp in staged) {
+        try {
+          await tmp.delete();
+        } catch (_) {}
+      }
+      rethrow;
     }
   }
 }

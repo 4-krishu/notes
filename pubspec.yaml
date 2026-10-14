@@ -41,6 +41,9 @@ dependencies:
   # OPEN DOCUMENTS (vault)
   open_filex: ^4.0.0
 
+  # IMAGE THUMBNAILS (vault grid)
+  image: ^4.2.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
