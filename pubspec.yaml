@@ -38,6 +38,9 @@ dependencies:
   # VIDEO PLAYBACK (vault)
   video_player: ^2.8.6
 
+  # OPEN DOCUMENTS (vault)
+  open_filex: ^4.0.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:hive/hive.dart';
 import '../security/vault_crypto.dart';
 import 'vault_home_screen.dart';
+import 'vault_theme.dart';
 
 class VaultLockScreen extends StatefulWidget {
   const VaultLockScreen({super.key});
@@ -153,13 +154,20 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
       context: context,
       builder: (dialogContext) {
         return AlertDialog(
+          backgroundColor: VaultTheme.surface,
           title: Text(
             savedQuestion!,
-            style: const TextStyle(fontSize: 16),
+            style: const TextStyle(
+              fontSize: 16,
+              color: VaultTheme.textPrimary,
+            ),
           ),
           content: TextField(
             controller: _answerController,
-            decoration: const InputDecoration(hintText: "Answer"),
+            style:
+                const TextStyle(color: VaultTheme.textPrimary),
+            decoration:
+                VaultTheme.inputDecoration("Answer"),
           ),
           actions: [
             TextButton(
@@ -196,9 +204,10 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.pink.shade50,
+      backgroundColor: VaultTheme.background,
       appBar: AppBar(
-        backgroundColor: Colors.pink,
+        backgroundColor: VaultTheme.background,
+        elevation: 0,
         title: Text(isFirstTime ? "Set Vault Password" : "Unlock Vault"),
       ),
       body: Center(
@@ -206,33 +215,31 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
           child: Padding(
             padding: const EdgeInsets.all(20),
             child: Container(
-              padding: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: const [
-                  BoxShadow(blurRadius: 10, color: Colors.black12)
-                ],
-              ),
+              padding: const EdgeInsets.all(24),
+              decoration: VaultTheme.cardDecoration(),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Icon(Icons.lock, size: 60, color: Colors.pink),
+                  const Icon(
+                    Icons.lock,
+                    size: 56,
+                    color: VaultTheme.accent,
+                  ),
                   const SizedBox(height: 20),
 
                   TextField(
                     controller: _passwordController,
                     obscureText: obscure,
-                    decoration: InputDecoration(
-                      labelText: "Password",
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                      ),
+                    style:
+                        const TextStyle(color: VaultTheme.textPrimary),
+                    decoration: VaultTheme.inputDecoration("Password")
+                        .copyWith(
                       suffixIcon: IconButton(
                         icon: Icon(
                           obscure
                               ? Icons.visibility_off
                               : Icons.visibility,
+                          color: VaultTheme.textSecondary,
                         ),
                         onPressed: () {
                           setState(() {
@@ -249,18 +256,19 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
                     TextField(
                       controller: _confirmController,
                       obscureText: obscure,
-                      decoration: InputDecoration(
-                        labelText: "Confirm Password",
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
+                      style: const TextStyle(
+                          color: VaultTheme.textPrimary),
+                      decoration: VaultTheme.inputDecoration(
+                          "Confirm Password"),
                     ),
                     const SizedBox(height: 15),
 
                     DropdownButtonFormField<String>(
                       isExpanded: true,
                       initialValue: selectedQuestion,
+                      dropdownColor: VaultTheme.surfaceLight,
+                      style: const TextStyle(
+                          color: VaultTheme.textPrimary),
                       items: questions.map((q) {
                         return DropdownMenuItem<String>(
                           value: q,
@@ -276,24 +284,18 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
                           selectedQuestion = v!;
                         });
                       },
-                      decoration: InputDecoration(
-                        labelText: "Security Question",
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
+                      decoration: VaultTheme.inputDecoration(
+                          "Security Question"),
                     ),
 
                     const SizedBox(height: 15),
 
                     TextField(
                       controller: _answerController,
-                      decoration: InputDecoration(
-                        labelText: "Answer",
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
+                      style: const TextStyle(
+                          color: VaultTheme.textPrimary),
+                      decoration:
+                          VaultTheme.inputDecoration("Answer"),
                     ),
 
                     const SizedBox(height: 15),
@@ -303,8 +305,13 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
                     width: double.infinity,
                     child: ElevatedButton(
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.pink,
-                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        backgroundColor: VaultTheme.accent,
+                        foregroundColor: Colors.white,
+                        padding:
+                            const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
                       ),
                       onPressed: _submit,
                       child: Text(
@@ -318,6 +325,9 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
                   if (!isFirstTime)
                     TextButton(
                       onPressed: _forgotPassword,
+                      style: TextButton.styleFrom(
+                        foregroundColor: VaultTheme.accent,
+                      ),
                       child: const Text("Forgot Password?"),
                     ),
                 ],

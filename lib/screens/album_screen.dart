@@ -4,25 +4,33 @@ import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:hive/hive.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 
 import '../security/vault_crypto.dart';
+import 'vault_theme.dart';
 
 /// One decrypted vault item. Bytes are decrypted on load; the file on disk
 /// stays encrypted at all times.
 class _VaultFile {
   final String path; // encrypted .enc file on disk
+  final String name; // original filename without the .enc suffix
   final String ext; // original extension, e.g. ".jpg"
   final bool isVideo;
+  final bool isImage;
   final Uint8List bytes; // decrypted bytes (memory only)
 
   _VaultFile({
     required this.path,
+    required this.name,
     required this.ext,
     required this.isVideo,
+    required this.isImage,
     required this.bytes,
   });
+
+  bool get isDocument => !isVideo && !isImage;
 }
 
 class AlbumScreen extends StatefulWidget {
@@ -58,6 +66,15 @@ class _AlbumScreenState extends State<AlbumScreen> {
     '.webm',
   ];
 
+  static const List<String> _imageExts = [
+    '.jpg',
+    '.jpeg',
+    '.png',
+    '.gif',
+    '.webp',
+    '.bmp',
+  ];
+
   @override
   void initState() {
     super.initState();
@@ -74,18 +91,15 @@ class _AlbumScreenState extends State<AlbumScreen> {
     return folder.path;
   }
 
-  String _extOf(String path) {
-    final dot = path.lastIndexOf('.');
-    if (dot == -1) return '';
-    return path.substring(dot).toLowerCase();
-  }
-
-  bool _bytesEqual(Uint8List a, Uint8List b) {
-    if (a.length != b.length) return false;
-    for (var i = 0; i < a.length; i++) {
-      if (a[i] != b[i]) return false;
+  /// "1730000000000_0.jpg.enc" -> ".jpg"
+  String _extOf(String fileName) {
+    var name = fileName;
+    if (name.endsWith('.enc')) {
+      name = name.substring(0, name.length - '.enc'.length);
     }
-    return true;
+    final dot = name.lastIndexOf('.');
+    if (dot == -1) return '';
+    return name.substring(dot).toLowerCase();
   }
 
   /// Imports files: encrypts a copy into the vault, verifies the round-trip,
@@ -93,7 +107,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
   Future<void> _pickMedia() async {
     final result = await FilePicker.platform.pickFiles(
       allowMultiple: true,
-      type: FileType.media,
+      type: FileType.any,
     );
 
     if (result == null) return;
@@ -106,7 +120,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
       final original = File(picked.path!);
 
       try {
-        final ext = _extOf(picked.path!);
+        final ext = _extOf(picked.name);
         final name =
             '${DateTime.now().millisecondsSinceEpoch}_${counter++}$ext.enc';
         final destPath = '$vaultPath/$name';
@@ -123,7 +137,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
           widget.password,
           _salt,
         );
-        if (!_bytesEqual(roundTrip, plain)) {
+        if (!VaultCrypto.bytesEqual(roundTrip, plain)) {
           throw const FormatException('Encryption verification failed');
         }
 
@@ -158,15 +172,16 @@ class _AlbumScreenState extends State<AlbumScreen> {
           final data = await file.readAsBytes();
           final bytes =
               VaultCrypto.decryptBytes(data, widget.password, _salt);
-          // Filename format: <millis>_<n>.<ext>.enc
           final fileName = file.path.split('/').last;
-          final withoutEnc =
-              fileName.substring(0, fileName.length - '.enc'.length);
-          final ext = _extOf(withoutEnc);
+          final name = fileName.substring(
+              0, fileName.length - '.enc'.length);
+          final ext = _extOf(fileName);
           loaded.add(_VaultFile(
             path: file.path,
+            name: name,
             ext: ext,
             isVideo: _videoExts.contains(ext),
+            isImage: _imageExts.contains(ext),
             bytes: bytes,
           ));
         } catch (_) {
@@ -184,6 +199,10 @@ class _AlbumScreenState extends State<AlbumScreen> {
       if (mounted) setState(() => loading = false);
     }
   }
+
+  // ------------------------------------------------------------------
+  // Selection: delete / move
+  // ------------------------------------------------------------------
 
   void _toggleSelection(int index) {
     setState(() {
@@ -217,10 +236,16 @@ class _AlbumScreenState extends State<AlbumScreen> {
       context: context,
       builder: (dialogContext) {
         return AlertDialog(
-          title: const Text("Delete files?"),
+          backgroundColor: VaultTheme.surface,
+          title: const Text(
+            "Delete files?",
+            style: TextStyle(color: VaultTheme.textPrimary),
+          ),
           content: Text(
             "Delete ${selectedIndexes.length} file(s)? "
             "This cannot be undone.",
+            style:
+                const TextStyle(color: VaultTheme.textSecondary),
           ),
           actions: [
             TextButton(
@@ -249,7 +274,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
               },
               child: const Text(
                 "Delete",
-                style: TextStyle(color: Colors.red),
+                style: TextStyle(color: VaultTheme.danger),
               ),
             ),
           ],
@@ -258,13 +283,212 @@ class _AlbumScreenState extends State<AlbumScreen> {
     );
   }
 
-  void _openViewer(int index) {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => FullScreenViewer(
-          media: media,
-          initialIndex: index,
+  /// Moves the selected files to another album. No re-encryption needed:
+  /// encryption is password-based, not album-based.
+  void _moveSelected() {
+    if (selectedIndexes.isEmpty) return;
+
+    final allAlbums = List<String>.from(
+      Hive.box('settings').get(
+        'vault_albums',
+        defaultValue: const <String>[],
+      ),
+    );
+    final targets =
+        allAlbums.where((a) => a != widget.albumName).toList();
+
+    if (targets.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("No other albums to move to")),
+      );
+      return;
+    }
+
+    showDialog(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: VaultTheme.surface,
+          title: const Text(
+            "Move to album",
+            style: TextStyle(color: VaultTheme.textPrimary),
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: targets.length,
+              itemBuilder: (_, i) {
+                return ListTile(
+                  leading: const Icon(Icons.folder_outlined,
+                      color: VaultTheme.accent),
+                  title: Text(
+                    targets[i],
+                    style: const TextStyle(
+                        color: VaultTheme.textPrimary),
+                  ),
+                  onTap: () async {
+                    Navigator.pop(dialogContext);
+                    final docs =
+                        await getApplicationDocumentsDirectory();
+                    final destDir = Directory(
+                        '${docs.path}/vault/${targets[i]}');
+                    if (!await destDir.exists()) {
+                      await destDir.create(recursive: true);
+                    }
+                    final items = selectedIndexes
+                        .map((idx) => media[idx])
+                        .toList();
+                    for (final item in items) {
+                      try {
+                        final fileName =
+                            item.path.split('/').last;
+                        await File(item.path).rename(
+                            '${destDir.path}/$fileName');
+                      } catch (_) {
+                        // Continue with the rest.
+                      }
+                    }
+                    if (mounted) {
+                      setState(() {
+                        media.removeWhere(
+                            (m) => items.contains(m));
+                        selectedIndexes.clear();
+                        selectionMode = false;
+                      });
+                    }
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(
+                              "Moved ${items.length} file(s) to ${targets[i]}"),
+                        ),
+                      );
+                    }
+                  },
+                );
+              },
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Opening files
+  // ------------------------------------------------------------------
+
+  void _openItem(int index) {
+    final item = media[index];
+    if (item.isDocument) {
+      _openDocument(item);
+    } else {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => FullScreenViewer(
+            media: media,
+            initialIndex: index,
+          ),
+        ),
+      );
+    }
+  }
+
+  /// Decrypts a document to a temp file and opens it with an external app.
+  Future<void> _openDocument(_VaultFile item) async {
+    try {
+      final tmp = await getTemporaryDirectory();
+      final path =
+          '${tmp.path}/vault_doc_${DateTime.now().millisecondsSinceEpoch}${item.ext}';
+      await File(path).writeAsBytes(item.bytes, flush: true);
+      await OpenFilex.open(path);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Couldn't open file: $e")),
+        );
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // UI
+  // ------------------------------------------------------------------
+
+  Widget _buildTile(_VaultFile file, bool selected) {
+    Widget content;
+    if (file.isVideo) {
+      content = Container(
+        color: VaultTheme.surfaceLight,
+        child: const Stack(
+          alignment: Alignment.center,
+          children: [
+            Icon(Icons.videocam_outlined,
+                size: 36, color: VaultTheme.textSecondary),
+            Positioned(
+              bottom: 6,
+              right: 6,
+              child: Icon(Icons.play_circle_filled,
+                  size: 20, color: VaultTheme.accent),
+            ),
+          ],
+        ),
+      );
+    } else if (file.isImage) {
+      content = Image.memory(file.bytes, fit: BoxFit.cover);
+    } else {
+      content = Container(
+        color: VaultTheme.surfaceLight,
+        padding: const EdgeInsets.all(8),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.description_outlined,
+                size: 32, color: VaultTheme.accent),
+            const SizedBox(height: 6),
+            Text(
+              file.name,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: VaultTheme.textSecondary,
+                fontSize: 10,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        border: selected
+            ? Border.all(color: VaultTheme.accent, width: 2.5)
+            : null,
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            content,
+            if (selected)
+              Container(
+                color: VaultTheme.accent.withOpacity(0.25),
+                child: const Align(
+                  alignment: Alignment.topRight,
+                  child: Padding(
+                    padding: EdgeInsets.all(6),
+                    child: Icon(Icons.check_circle,
+                        color: VaultTheme.accent),
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );
@@ -273,74 +497,108 @@ class _AlbumScreenState extends State<AlbumScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.pink.shade50,
+      backgroundColor: VaultTheme.background,
       appBar: AppBar(
-        backgroundColor: Colors.pink,
-        title: Text(widget.albumName),
+        backgroundColor: VaultTheme.background,
+        elevation: 0,
+        title: Text(
+          selectionMode
+              ? "${selectedIndexes.length} selected"
+              : widget.albumName,
+          style: const TextStyle(
+            color: VaultTheme.textPrimary,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        iconTheme:
+            const IconThemeData(color: VaultTheme.textPrimary),
         actions: [
-          if (selectionMode)
+          if (selectionMode) ...[
             IconButton(
               icon: const Icon(Icons.select_all),
+              tooltip: "Select all",
               onPressed: _selectAll,
             ),
-          if (selectionMode)
             IconButton(
-              icon: const Icon(Icons.delete),
+              icon: const Icon(Icons.drive_file_move_outlined),
+              tooltip: "Move to album",
+              onPressed: _moveSelected,
+            ),
+            IconButton(
+              icon: const Icon(Icons.delete_outline),
+              tooltip: "Delete",
               onPressed: _deleteSelected,
             ),
+          ],
         ],
       ),
       body: loading
           ? const Center(child: CircularProgressIndicator())
           : media.isEmpty
-              ? const Center(child: Text("No media"))
+              ? Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(20),
+                        decoration: BoxDecoration(
+                          color: VaultTheme.surface,
+                          borderRadius: BorderRadius.circular(28),
+                        ),
+                        child: const Icon(
+                          Icons.photo_library_outlined,
+                          size: 40,
+                          color: VaultTheme.textSecondary,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      const Text(
+                        "Nothing here yet",
+                        style: TextStyle(
+                          color: VaultTheme.textPrimary,
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        "Tap + to import photos, videos or files",
+                        style: TextStyle(
+                            color: VaultTheme.textSecondary),
+                      ),
+                    ],
+                  ),
+                )
               : GridView.builder(
-                  padding: const EdgeInsets.all(10),
+                  padding: const EdgeInsets.all(12),
                   itemCount: media.length,
                   gridDelegate:
                       const SliverGridDelegateWithFixedCrossAxisCount(
                     crossAxisCount: 3,
-                    crossAxisSpacing: 6,
-                    mainAxisSpacing: 6,
+                    crossAxisSpacing: 8,
+                    mainAxisSpacing: 8,
                   ),
                   itemBuilder: (_, i) {
                     final file = media[i];
-                    final selected = selectedIndexes.contains(i);
+                    final selected =
+                        selectedIndexes.contains(i);
 
                     return GestureDetector(
                       onTap: () {
                         if (selectionMode) {
                           _toggleSelection(i);
                         } else {
-                          _openViewer(i);
+                          _openItem(i);
                         }
                       },
                       onLongPress: () => _toggleSelection(i),
-                      child: Stack(
-                        children: [
-                          Positioned.fill(
-                            child: file.isVideo
-                                ? Container(
-                                    color: Colors.black12,
-                                    child: const Icon(Icons.video_file),
-                                  )
-                                : Image.memory(file.bytes,
-                                    fit: BoxFit.cover),
-                          ),
-                          if (selected)
-                            const Positioned(
-                              top: 5,
-                              right: 5,
-                              child: Icon(Icons.check_circle,
-                                  color: Colors.pink),
-                            ),
-                        ],
-                      ),
+                      child: _buildTile(file, selected),
                     );
                   },
                 ),
       floatingActionButton: FloatingActionButton(
-        backgroundColor: Colors.pink,
+        backgroundColor: VaultTheme.accent,
+        foregroundColor: Colors.white,
         onPressed: _pickMedia,
         child: const Icon(Icons.add),
       ),
@@ -435,6 +693,15 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
         itemBuilder: (_, i) {
           final item = widget.media[i];
 
+          if (item.isDocument) {
+            return const Center(
+              child: Text(
+                "Preview not available",
+                style: TextStyle(color: Colors.white70),
+              ),
+            );
+          }
+
           if (!item.isVideo) {
             return Center(child: Image.memory(item.bytes));
           }
@@ -461,7 +728,8 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
                         ),
                         onPressed: () {
                           setState(() {
-                            if (_videoController!.value.isPlaying) {
+                            if (_videoController!
+                                .value.isPlaying) {
                               _videoController!.pause();
                             } else {
                               _videoController!.play();

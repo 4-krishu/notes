@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -81,5 +82,56 @@ class VaultCrypto {
     final key = enc.Key(_aesKey(password, salt));
     final encrypter = enc.Encrypter(enc.AES(key));
     return Uint8List.fromList(encrypter.decryptBytes(cipher, iv: iv));
+  }
+
+  /// Compares two byte lists. Used to verify encrypt/decrypt round-trips.
+  static bool bytesEqual(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    var diff = 0;
+    for (var i = 0; i < a.length; i++) {
+      diff |= a[i] ^ b[i];
+    }
+    return diff == 0;
+  }
+
+  /// Re-encrypts every `.enc` file under [vaultRoot] from [oldPassword] to
+  /// [newPassword].
+  ///
+  /// Two-phase, so a wrong password or corrupt file aborts BEFORE anything
+  /// is overwritten: first ALL files are decrypted with the old password
+  /// (throws on failure), then each file is re-encrypted with the new
+  /// password, verified, and only then written back.
+  ///
+  /// The caller must update the stored password hash only after this
+  /// completes without throwing.
+  static Future<void> changePassword({
+    required String vaultRoot,
+    required String oldPassword,
+    required String newPassword,
+    required String salt,
+  }) async {
+    final root = Directory(vaultRoot);
+    final files = <File>[];
+    if (await root.exists()) {
+      await for (final e in root.list(recursive: true)) {
+        if (e is File && e.path.endsWith('.enc')) files.add(e);
+      }
+    }
+
+    // Phase 1: decrypt everything with the OLD password.
+    final decrypted = <File, Uint8List>{};
+    for (final f in files) {
+      decrypted[f] = decryptBytes(await f.readAsBytes(), oldPassword, salt);
+    }
+
+    // Phase 2: re-encrypt with the NEW password, verify, overwrite.
+    for (final entry in decrypted.entries) {
+      final encrypted = encryptBytes(entry.value, newPassword, salt);
+      final check = decryptBytes(encrypted, newPassword, salt);
+      if (!bytesEqual(check, entry.value)) {
+        throw const FormatException('Re-encryption verification failed');
+      }
+      await entry.key.writeAsBytes(encrypted, flush: true);
+    }
   }
 }
