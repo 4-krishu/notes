@@ -12,6 +12,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 
 import '../security/vault_crypto.dart';
+import '../security/vault_storage.dart';
 import 'vault_theme.dart';
 
 /// One vault item. The grid only ever holds the small thumbnail bytes;
@@ -47,10 +48,14 @@ class AlbumScreen extends StatefulWidget {
   /// Vault password, kept in memory only. Used to encrypt/decrypt files.
   final String password;
 
+  /// When true, operate inside the decoy vault instead of the real one.
+  final bool decoy;
+
   const AlbumScreen({
     super.key,
     required this.albumName,
     required this.password,
+    this.decoy = false,
   });
 
   @override
@@ -68,6 +73,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
   String _sortMode = 'newest';
 
   late final String _salt;
+  late final VaultStorage _storage;
 
   /// Files larger than this are skipped on import: encrypting them would
   /// need several times their size in RAM at once.
@@ -93,19 +99,15 @@ class _AlbumScreenState extends State<AlbumScreen> {
   @override
   void initState() {
     super.initState();
+    _storage = VaultStorage(decoy: widget.decoy);
     _salt = VaultCrypto.getOrCreateSalt(Hive.box('settings'));
     _sortMode = Hive.box('settings')
-            .get('vault_sort', defaultValue: 'newest')
-        as String;
+        .get(_storage.sortKey, defaultValue: 'newest') as String;
     _loadMedia();
   }
 
   Future<String> _getVaultPath() async {
-    final dir = await getApplicationDocumentsDirectory();
-    final folder = Directory('${dir.path}/vault/${widget.albumName}');
-    if (!await folder.exists()) {
-      await folder.create(recursive: true);
-    }
+    final folder = await _storage.albumDir(widget.albumName);
     return folder.path;
   }
 
@@ -329,7 +331,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
 
   void _changeSort(String mode) {
     _sortMode = mode;
-    Hive.box('settings').put('vault_sort', mode);
+    Hive.box('settings').put(_storage.sortKey, mode);
     setState(_sortList);
   }
 
@@ -451,7 +453,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
 
     final allAlbums = List<String>.from(
       Hive.box('settings').get(
-        'vault_albums',
+        _storage.albumsKey,
         defaultValue: const <String>[],
       ),
     );
@@ -490,13 +492,8 @@ class _AlbumScreenState extends State<AlbumScreen> {
                   ),
                   onTap: () async {
                     Navigator.pop(dialogContext);
-                    final docs =
-                        await getApplicationDocumentsDirectory();
-                    final destDir = Directory(
-                        '${docs.path}/vault/${targets[i]}');
-                    if (!await destDir.exists()) {
-                      await destDir.create(recursive: true);
-                    }
+                    final destDir =
+                        await _storage.albumDir(targets[i]);
                     final items = selectedIndexes
                         .map((idx) => media[idx])
                         .toList();

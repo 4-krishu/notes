@@ -1,12 +1,18 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:hive/hive.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:sensors_plus/sensors_plus.dart';
 
 import '../security/vault_crypto.dart';
+import '../security/vault_prefs.dart';
+import '../security/vault_storage.dart';
 import 'album_screen.dart';
+import 'vault_lock_screen.dart';
+import 'vault_settings_screen.dart';
 import 'vault_theme.dart';
 
 class VaultHomeScreen extends StatefulWidget {
@@ -14,15 +20,25 @@ class VaultHomeScreen extends StatefulWidget {
   /// Never persisted.
   final String password;
 
-  const VaultHomeScreen({super.key, required this.password});
+  /// When true, this screen shows the decoy vault (separate directory,
+  /// separate album list) instead of the real one.
+  final bool decoy;
+
+  const VaultHomeScreen({
+    super.key,
+    required this.password,
+    this.decoy = false,
+  });
 
   @override
   State<VaultHomeScreen> createState() => _VaultHomeScreenState();
 }
 
-class _VaultHomeScreenState extends State<VaultHomeScreen> {
+class _VaultHomeScreenState extends State<VaultHomeScreen>
+    with WidgetsBindingObserver {
   late Box settingsBox;
   late String _salt;
+  late VaultStorage _storage;
 
   /// In-memory password; updated after a successful password change.
   late String _password;
@@ -32,33 +48,107 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
   Map<String, Uint8List> covers = {};
   bool loading = true;
 
-  static const String _albumsKey = 'vault_albums';
+  // --- auto-lock ---
+  int? _backgroundedAtMs;
+
+  // --- panic gesture (shake to lock) ---
+  StreamSubscription<AccelerometerEvent>? _shakeSub;
+  final List<int> _spikeTimes = [];
+  int _lastShakeTriggerMs = 0;
+
+  List<String> get _defaultAlbums => widget.decoy
+      ? const ["Photos", "Videos"]
+      : const ["Private", "Videos", "Favorites"];
 
   @override
   void initState() {
     super.initState();
     _password = widget.password;
+    _storage = VaultStorage(decoy: widget.decoy);
     settingsBox = Hive.box('settings');
     _salt = VaultCrypto.getOrCreateSalt(settingsBox);
     // Albums are persisted so they survive app restarts.
     albums = List<String>.from(
       settingsBox.get(
-        _albumsKey,
-        defaultValue: const ["Private", "Videos", "Favorites"],
+        _storage.albumsKey,
+        defaultValue: _defaultAlbums,
       ),
     );
+    WidgetsBinding.instance.addObserver(this);
+    _subscribeShake();
     _refresh();
   }
 
-  Future<Directory> _albumDir(String name) async {
-    final dir = await getApplicationDocumentsDirectory();
-    return Directory('${dir.path}/vault/$name');
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _shakeSub?.cancel();
+    super.dispose();
   }
 
-  Future<String> _vaultRoot() async {
-    final dir = await getApplicationDocumentsDirectory();
-    return '${dir.path}/vault';
+  // ------------------------------------------------------------------
+  // Auto-lock: if the app was in the background longer than the
+  // configured timeout, require re-authentication on return.
+  // ------------------------------------------------------------------
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) {
+      _backgroundedAtMs = DateTime.now().millisecondsSinceEpoch;
+    } else if (state == AppLifecycleState.resumed) {
+      final timeout = VaultPrefs.getInt(VaultPrefs.autoLockSeconds);
+      final bgAt = _backgroundedAtMs;
+      _backgroundedAtMs = null;
+      if (timeout > 0 && bgAt != null) {
+        final awaySecs =
+            (DateTime.now().millisecondsSinceEpoch - bgAt) ~/ 1000;
+        if (awaySecs >= timeout) _relock();
+      }
+    }
   }
+
+  void _relock() {
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const VaultLockScreen()),
+      (route) => route.isFirst,
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Panic gesture: two firm shakes within ~1 second instantly lock.
+  // ------------------------------------------------------------------
+
+  void _subscribeShake() {
+    _shakeSub = accelerometerEventStream().listen(
+      (event) {
+        if (!VaultPrefs.getBool(VaultPrefs.shakeLockEnabled)) return;
+        final g = sqrt(event.x * event.x +
+                event.y * event.y +
+                event.z * event.z) /
+            9.81;
+        if (g < 2.6) return; // not a firm shake
+        final now = DateTime.now().millisecondsSinceEpoch;
+        _spikeTimes.add(now);
+        _spikeTimes.removeWhere((t) => now - t > 1000);
+        if (_spikeTimes.length >= 2 &&
+            now - _lastShakeTriggerMs > 3000) {
+          _lastShakeTriggerMs = now;
+          _spikeTimes.clear();
+          _panicLock();
+        }
+      },
+      onError: (_) {},
+    );
+  }
+
+  void _panicLock() {
+    if (!mounted) return;
+    // Pop everything above the notes screen: the vault just vanishes.
+    Navigator.of(context).popUntil((route) => route.isFirst);
+  }
+
+  Future<String> _vaultRoot() => _storage.rootPath();
 
   Future<void> _refresh() async {
     if (mounted) setState(() => loading = true);
@@ -67,7 +157,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
     final newCovers = <String, Uint8List>{};
 
     for (final name in albums) {
-      final folder = await _albumDir(name);
+      final folder = await _storage.albumDir(name);
       if (await folder.exists()) {
         final entries = await folder.list().toList();
         final files = entries.whereType<File>().toList();
@@ -108,7 +198,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
     }
   }
 
-  void _saveAlbums() => settingsBox.put(_albumsKey, albums);
+  void _saveAlbums() => settingsBox.put(_storage.albumsKey, albums);
 
   // ------------------------------------------------------------------
   // Albums: create / rename / delete
@@ -205,7 +295,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
                 return;
               }
               try {
-                final oldDir = await _albumDir(oldName);
+                final oldDir = await _storage.albumDir(oldName);
                 if (await oldDir.exists()) {
                   final root = await _vaultRoot();
                   await oldDir.rename('$root/$name');
@@ -253,7 +343,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
             onPressed: () async {
               Navigator.pop(dialogContext);
               try {
-                final dir = await _albumDir(name);
+                final dir = await _storage.albumDir(name);
                 if (await dir.exists()) {
                   await dir.delete(recursive: true);
                 }
@@ -313,129 +403,20 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
   }
 
   // ------------------------------------------------------------------
-  // Change password
+  // Navigation
   // ------------------------------------------------------------------
 
-  void _changePassword() {
-    final currentCtrl = TextEditingController();
-    final newCtrl = TextEditingController();
-    final confirmCtrl = TextEditingController();
-
-    void disposeAll() {
-      currentCtrl.dispose();
-      newCtrl.dispose();
-      confirmCtrl.dispose();
-    }
-
-    showDialog(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        backgroundColor: VaultTheme.surface,
-        title: const Text(
-          "Change Password",
-          style: TextStyle(color: VaultTheme.textPrimary),
+  void _openSettings() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => VaultSettingsScreen(
+          password: _password,
+          decoy: widget.decoy,
+          onPasswordChanged: (np) => setState(() => _password = np),
         ),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: currentCtrl,
-                obscureText: true,
-                style:
-                    const TextStyle(color: VaultTheme.textPrimary),
-                decoration:
-                    VaultTheme.inputDecoration("Current password"),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: newCtrl,
-                obscureText: true,
-                style:
-                    const TextStyle(color: VaultTheme.textPrimary),
-                decoration:
-                    VaultTheme.inputDecoration("New password"),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: confirmCtrl,
-                obscureText: true,
-                style:
-                    const TextStyle(color: VaultTheme.textPrimary),
-                decoration: VaultTheme.inputDecoration(
-                    "Confirm new password"),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              disposeAll();
-              Navigator.pop(dialogContext);
-            },
-            child: const Text("Cancel"),
-          ),
-          TextButton(
-            onPressed: () async {
-              final current = currentCtrl.text.trim();
-              final newPw = newCtrl.text.trim();
-              final confirm = confirmCtrl.text.trim();
-
-              if (newPw.length < 4) {
-                _snack("New password must be at least 4 characters");
-                return;
-              }
-              if (newPw != confirm) {
-                _snack("New passwords do not match");
-                return;
-              }
-
-              // Block the UI while re-encrypting every file.
-              showDialog(
-                context: context,
-                barrierDismissible: false,
-                builder: (_) => const Center(
-                  child: CircularProgressIndicator(),
-                ),
-              );
-
-              try {
-                final root = await _vaultRoot();
-                await VaultCrypto.changePassword(
-                  vaultRoot: root,
-                  oldPassword: current,
-                  newPassword: newPw,
-                  salt: _salt,
-                );
-                // Only now is it safe to replace the stored hash.
-                settingsBox.put(
-                  VaultCrypto.passwordHashKey,
-                  VaultCrypto.hashPassword(newPw, _salt),
-                );
-                setState(() => _password = newPw);
-                disposeAll();
-                if (mounted) {
-                  Navigator.pop(context); // loading
-                  Navigator.pop(dialogContext); // dialog
-                  _snack("Password changed");
-                }
-              } catch (e) {
-                if (mounted) {
-                  Navigator.pop(context); // loading
-                  _snack(
-                      "Couldn't change password. Wrong current password?");
-                }
-              }
-            },
-            child: const Text(
-              "Change",
-              style: TextStyle(color: VaultTheme.accent),
-            ),
-          ),
-        ],
       ),
-    );
+    ).then((_) => _refresh());
   }
 
   // ------------------------------------------------------------------
@@ -454,6 +435,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
         builder: (_) => AlbumScreen(
           albumName: name,
           password: _password,
+          decoy: widget.decoy,
         ),
       ),
     ).then((_) => _refresh());
@@ -593,12 +575,30 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
       appBar: AppBar(
         backgroundColor: VaultTheme.background,
         elevation: 0,
-        title: const Text(
-          "Vault",
-          style: TextStyle(
-            color: VaultTheme.textPrimary,
-            fontWeight: FontWeight.bold,
-          ),
+        // In decoy mode a small dot sits next to the title: subtle enough
+        // that only the owner knows what it means.
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              "Vault",
+              style: TextStyle(
+                color: VaultTheme.textPrimary,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            if (widget.decoy) ...[
+              const SizedBox(width: 8),
+              Container(
+                width: 8,
+                height: 8,
+                decoration: const BoxDecoration(
+                  color: VaultTheme.accent,
+                  shape: BoxShape.circle,
+                ),
+              ),
+            ],
+          ],
         ),
         actions: [
           PopupMenuButton<String>(
@@ -606,13 +606,13 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
                 color: VaultTheme.textPrimary),
             color: VaultTheme.surface,
             onSelected: (v) {
-              if (v == 'change_pw') _changePassword();
+              if (v == 'settings') _openSettings();
             },
             itemBuilder: (_) => const [
               PopupMenuItem(
-                value: 'change_pw',
+                value: 'settings',
                 child: Text(
-                  "Change password",
+                  "Settings",
                   style:
                       TextStyle(color: VaultTheme.textPrimary),
                 ),
