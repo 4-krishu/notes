@@ -21,7 +21,7 @@ dependencies:
   # DATE FORMAT
   intl: ^0.18.1
 
-  # MEDIA PICKER (for vault later)
+  # MEDIA PICKER (for vault)
   image_picker: ^1.0.7
   file_picker: ^8.3.7
 
@@ -30,6 +30,13 @@ dependencies:
 
   # PERMISSIONS (needed for gallery access)
   permission_handler: ^11.3.0
+
+  # SECURITY (vault password hashing + file encryption)
+  crypto: ^3.0.3
+  encrypt: ^5.0.3
+
+  # VIDEO PLAYBACK (vault)
+  video_player: ^2.8.6
 
 dev_dependencies:
   flutter_test:

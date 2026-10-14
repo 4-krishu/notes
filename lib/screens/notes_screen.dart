@@ -6,7 +6,7 @@ import 'edit_note_screen.dart';
 import 'edit_checklist_screen.dart';
 import 'vault_lock_screen.dart';
 
-enum DrawerSection { notes, reminders, labels, archive, settings, help }
+enum DrawerSection { notes, reminders, archive }
 
 class NotesScreen extends StatefulWidget {
   const NotesScreen({super.key});
@@ -228,10 +228,6 @@ class _NotesScreenState extends State<NotesScreen> {
       case DrawerSection.reminders:
       case DrawerSection.archive:
         return _buildNotesGrid();
-      case DrawerSection.labels:
-        return const Center(child: Text("Coming soon"));
-      default:
-        return const Center(child: Text("Coming soon"));
     }
   }
 
@@ -364,15 +360,12 @@ class _NotesScreenState extends State<NotesScreen> {
               ),
             ),
             _drawerItem(Icons.note, "Notes", DrawerSection.notes),
-            _drawerItem(Icons.label, "Labels", DrawerSection.labels),
             _drawerItem(
               Icons.notifications,
               "Reminders",
               DrawerSection.reminders,
             ),
             _drawerItem(Icons.archive, "Archive", DrawerSection.archive),
-            _drawerItem(Icons.settings, "Settings", DrawerSection.settings),
-            _drawerItem(Icons.help, "Help & Feedback", DrawerSection.help),
           ],
         ),
       ),

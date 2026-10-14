@@ -1,15 +1,61 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:hive/hive.dart';
+import 'package:path_provider/path_provider.dart';
+
 import 'album_screen.dart';
 
 class VaultHomeScreen extends StatefulWidget {
-  const VaultHomeScreen({super.key});
+  /// Vault password, kept in memory only. Used to encrypt/decrypt files.
+  /// Never persisted.
+  final String password;
+
+  const VaultHomeScreen({super.key, required this.password});
 
   @override
   State<VaultHomeScreen> createState() => _VaultHomeScreenState();
 }
 
 class _VaultHomeScreenState extends State<VaultHomeScreen> {
-  List<String> albums = ["Private", "Videos", "Favorites"];
+  late Box settingsBox;
+  List<String> albums = [];
+  Map<String, int> itemCounts = {};
+
+  static const String _albumsKey = 'vault_albums';
+
+  @override
+  void initState() {
+    super.initState();
+    settingsBox = Hive.box('settings');
+    // Albums are persisted so they survive app restarts.
+    albums = List<String>.from(
+      settingsBox.get(
+        _albumsKey,
+        defaultValue: const ["Private", "Videos", "Favorites"],
+      ),
+    );
+    _refreshCounts();
+  }
+
+  Future<Directory> _albumDir(String name) async {
+    final dir = await getApplicationDocumentsDirectory();
+    return Directory('${dir.path}/vault/$name');
+  }
+
+  Future<void> _refreshCounts() async {
+    final counts = <String, int>{};
+    for (final name in albums) {
+      final folder = await _albumDir(name);
+      if (await folder.exists()) {
+        final entries = await folder.list().toList();
+        counts[name] = entries.whereType<File>().length;
+      } else {
+        counts[name] = 0;
+      }
+    }
+    if (mounted) setState(() => itemCounts = counts);
+  }
 
   void _addAlbum() {
     final controller = TextEditingController();
@@ -25,19 +71,35 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
           ),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: () {
+                controller.dispose();
+                Navigator.pop(context);
+              },
               child: const Text("Cancel"),
             ),
             TextButton(
               onPressed: () {
                 final name = controller.text.trim();
+                controller.dispose();
                 if (name.isEmpty) return;
+
+                if (albums.contains(name)) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text("An album with this name already exists"),
+                    ),
+                  );
+                  Navigator.pop(context);
+                  return;
+                }
 
                 setState(() {
                   albums.add(name);
                 });
+                settingsBox.put(_albumsKey, albums);
 
                 Navigator.pop(context);
+                _refreshCounts();
               },
               child: const Text("Create"),
             ),
@@ -45,6 +107,18 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
         );
       },
     );
+  }
+
+  void _openAlbum(String name) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AlbumScreen(
+          albumName: name,
+          password: widget.password,
+        ),
+      ),
+    ).then((_) => _refreshCounts());
   }
 
   Widget _buildEmpty() {
@@ -69,16 +143,10 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
       ),
       itemBuilder: (_, i) {
         final name = albums[i];
+        final count = itemCounts[name] ?? 0;
 
         return GestureDetector(
-          onTap: () {
-            Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => AlbumScreen(albumName: name),
-              ),
-            );  // future: open album
-          },
+          onTap: () => _openAlbum(name),
           child: Container(
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
@@ -97,9 +165,9 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
                   style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
                 const SizedBox(height: 4),
-                const Text(
-                  "0 items",
-                  style: TextStyle(fontSize: 12),
+                Text(
+                  "$count ${count == 1 ? "item" : "items"}",
+                  style: const TextStyle(fontSize: 12),
                 ),
               ],
             ),

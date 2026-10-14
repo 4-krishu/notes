@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:hive/hive.dart';
-import 'vault_home_screen.dart'; // ✅ IMPORTANT
+import '../security/vault_crypto.dart';
+import 'vault_home_screen.dart';
 
 class VaultLockScreen extends StatefulWidget {
   const VaultLockScreen({super.key});
@@ -15,13 +16,16 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
   final TextEditingController _answerController = TextEditingController();
 
   late Box settingsBox;
+  late String salt;
 
   bool isFirstTime = false;
   bool obscure = true;
 
-  String? savedPassword;
+  String? savedHash;
   String? savedQuestion;
-  String? savedAnswer;
+  String? savedAnswerHash;
+
+  static const int minPasswordLength = 4;
 
   final List<String> questions = [
     "What was your first school?",
@@ -44,12 +48,41 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
   void initState() {
     super.initState();
     settingsBox = Hive.box('settings');
+    salt = VaultCrypto.getOrCreateSalt(settingsBox);
 
-    savedPassword = settingsBox.get('vault_password');
-    savedQuestion = settingsBox.get('vault_question');
-    savedAnswer = settingsBox.get('vault_answer');
+    // One-time migration: old plaintext password/answer -> salted hashes.
+    final oldPlainPassword = settingsBox.get('vault_password');
+    if (oldPlainPassword != null &&
+        settingsBox.get(VaultCrypto.passwordHashKey) == null) {
+      settingsBox.put(
+        VaultCrypto.passwordHashKey,
+        VaultCrypto.hashPassword(oldPlainPassword as String, salt),
+      );
+      settingsBox.delete('vault_password');
+    }
+    final oldPlainAnswer = settingsBox.get('vault_answer');
+    if (oldPlainAnswer != null &&
+        settingsBox.get(VaultCrypto.answerHashKey) == null) {
+      settingsBox.put(
+        VaultCrypto.answerHashKey,
+        VaultCrypto.hashAnswer(oldPlainAnswer as String, salt),
+      );
+      settingsBox.delete('vault_answer');
+    }
 
-    isFirstTime = savedPassword == null;
+    savedHash = settingsBox.get(VaultCrypto.passwordHashKey) as String?;
+    savedQuestion = settingsBox.get('vault_question') as String?;
+    savedAnswerHash = settingsBox.get(VaultCrypto.answerHashKey) as String?;
+
+    isFirstTime = savedHash == null;
+  }
+
+  @override
+  void dispose() {
+    _passwordController.dispose();
+    _confirmController.dispose();
+    _answerController.dispose();
+    super.dispose();
   }
 
   void _submit() {
@@ -57,6 +90,11 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
     final confirm = _confirmController.text.trim();
 
     if (pass.isEmpty) return;
+
+    if (pass.length < minPasswordLength) {
+      _showSnack("Password must be at least $minPasswordLength characters");
+      return;
+    }
 
     if (isFirstTime) {
       if (pass != confirm) {
@@ -69,30 +107,36 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
         return;
       }
 
-      settingsBox.put('vault_password', pass);
-      settingsBox.put('vault_question', selectedQuestion);
-      settingsBox.put('vault_answer', _answerController.text.trim());
-
-      // ✅ FIX HERE
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(
-          builder: (_) => const VaultHomeScreen(),
-        ),
+      // Store only hashes, never the plaintext password/answer.
+      settingsBox.put(
+        VaultCrypto.passwordHashKey,
+        VaultCrypto.hashPassword(pass, salt),
       );
+      settingsBox.put('vault_question', selectedQuestion);
+      settingsBox.put(
+        VaultCrypto.answerHashKey,
+        VaultCrypto.hashAnswer(_answerController.text, salt),
+      );
+
+      _openVault(pass);
     } else {
-      if (pass == savedPassword) {
-        // ✅ FIX HERE
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(
-            builder: (_) => const VaultHomeScreen(),
-          ),
-        );
+      final hash = VaultCrypto.hashPassword(pass, salt);
+      if (hash == savedHash) {
+        _openVault(pass);
       } else {
         _showSnack("Wrong password");
       }
     }
+  }
+
+  void _openVault(String password) {
+    // The plaintext password lives in memory only, for file encryption.
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => VaultHomeScreen(password: password),
+      ),
+    );
   }
 
   void _showSnack(String msg) {
@@ -107,7 +151,7 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
 
     showDialog(
       context: context,
-      builder: (_) {
+      builder: (dialogContext) {
         return AlertDialog(
           title: Text(
             savedQuestion!,
@@ -119,25 +163,24 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
           ),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: () => Navigator.pop(dialogContext),
               child: const Text("Cancel"),
             ),
             TextButton(
               onPressed: () {
-                if (_answerController.text.trim() == savedAnswer) {
-                  settingsBox.delete('vault_password');
-
+                final input = _answerController.text.trim();
+                final ok = input.isNotEmpty &&
+                    VaultCrypto.hashAnswer(input, salt) == savedAnswerHash;
+                if (ok) {
+                  // Wipe the old hash; the fresh lock screen will ask for
+                  // a new password (isFirstTime == true).
+                  settingsBox.delete(VaultCrypto.passwordHashKey);
+                  Navigator.pop(dialogContext);
                   Navigator.of(context).pushReplacement(
                     MaterialPageRoute(
                       builder: (_) => const VaultLockScreen(),
                     ),
                   );
-
-                  setState(() {
-                    isFirstTime = true;
-                  });
-
-                  _showSnack("Set new password");
                 } else {
                   _showSnack("Wrong answer");
                 }

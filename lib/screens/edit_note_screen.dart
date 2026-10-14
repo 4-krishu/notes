@@ -26,6 +26,13 @@ class _EditNoteScreenState extends State<EditNoteScreen> {
     contentController = TextEditingController(text: widget.note?.content ?? "");
   }
 
+  @override
+  void dispose() {
+    titleController.dispose();
+    contentController.dispose();
+    super.dispose();
+  }
+
   void saveNote() {
     final title = titleController.text.trim();
     final content = contentController.text.trim();
