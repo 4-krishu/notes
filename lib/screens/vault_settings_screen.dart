@@ -1,11 +1,13 @@
 import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:hive/hive.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../security/vault_backup.dart';
 import '../security/vault_crypto.dart';
 import '../security/vault_prefs.dart';
 import '../security/vault_storage.dart';
@@ -95,6 +97,216 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
   void _snack(String msg) {
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  // ------------------------------------------------------------------
+  // Blocking progress + text-prompt helpers
+  // ------------------------------------------------------------------
+
+  bool _busy = false;
+
+  void _showBusy(String label) {
+    _busy = true;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        backgroundColor: VaultTheme.surface,
+        content: Row(
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Text(
+                label,
+                style:
+                    const TextStyle(color: VaultTheme.textPrimary),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _hideBusy() {
+    _busy = false;
+    if (mounted) {
+      Navigator.pop(context);
+    }
+  }
+
+  /// Small text-prompt dialog. Returns the trimmed input, or null if
+  /// the user cancelled.
+  Future<String?> _askText({
+    required String title,
+    required String label,
+    String? message,
+    bool obscure = false,
+  }) {
+    final ctrl = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: VaultTheme.surface,
+        title: Text(
+          title,
+          style: const TextStyle(color: VaultTheme.textPrimary),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (message != null) ...[
+              Text(
+                message,
+                style: const TextStyle(
+                    color: VaultTheme.textSecondary,
+                    fontSize: 13),
+              ),
+              const SizedBox(height: 12),
+            ],
+            TextField(
+              controller: ctrl,
+              obscureText: obscure,
+              autofocus: true,
+              style:
+                  const TextStyle(color: VaultTheme.textPrimary),
+              decoration: VaultTheme.inputDecoration(label),
+              onSubmitted: (_) =>
+                  Navigator.pop(dialogContext, ctrl.text.trim()),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              ctrl.dispose();
+              Navigator.pop(dialogContext);
+            },
+            child: const Text("Cancel"),
+          ),
+          TextButton(
+            onPressed: () {
+              final v = ctrl.text.trim();
+              ctrl.dispose();
+              Navigator.pop(dialogContext, v);
+            },
+            child: const Text(
+              "Continue",
+              style: TextStyle(color: VaultTheme.accent),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Encrypted backup: export / restore
+  // ------------------------------------------------------------------
+
+  Future<void> _exportBackup() async {
+    try {
+      final dir = await FilePicker.platform.getDirectoryPath(
+        dialogTitle: 'Choose where to save the backup',
+      );
+      if (dir == null) return; // user cancelled
+
+      _showBusy('Creating encrypted backup...');
+      late final String path;
+      try {
+        path = await VaultBackup.exportBackup(
+          vaultRoot: await _storage.rootPath(),
+          password: _password,
+          salt: _salt,
+          targetDir: dir,
+        );
+      } finally {
+        _hideBusy();
+      }
+      if (mounted) {
+        _snack('Backup saved: ${path.split('/').last}');
+      }
+    } catch (e) {
+      if (mounted) _snack("Backup failed: $e");
+    }
+  }
+
+  Future<void> _restoreBackup() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.any,
+        allowMultiple: false,
+      );
+      if (result == null || result.files.isEmpty) return;
+      final path = result.files.single.path;
+      if (path == null) return;
+
+      // 1. The backup's password may differ from the current one.
+      final backupPw = await _askText(
+        title: 'Backup password',
+        label: 'Password used when the backup was created',
+        obscure: true,
+      );
+      if (backupPw == null || backupPw.isEmpty) return;
+
+      // 2. Decrypt the manifest (fails loudly on a wrong password).
+      _showBusy('Reading backup...');
+      late final Map<String, dynamic> manifest;
+      try {
+        manifest = await VaultBackup.inspectBackup(
+          backupPath: path,
+          password: backupPw,
+          salt: _salt,
+        );
+      } finally {
+        _hideBusy();
+      }
+
+      final albumCount =
+          (manifest['albums'] as List?)?.length ?? 0;
+      final exportedAt =
+          (manifest['exportedAt'] as String?) ?? 'unknown date';
+
+      // 3. Double-confirm: the user must type RESTORE.
+      final confirm = await _askText(
+        title: 'Restore will OVERWRITE the vault',
+        label: 'Type RESTORE to confirm',
+        message: 'Backup from $exportedAt with $albumCount album(s). '
+            'Everything currently in the vault will be replaced.',
+      );
+      if (confirm != 'RESTORE') {
+        if (mounted && confirm != null) {
+          _snack('Restore cancelled');
+        }
+        return;
+      }
+
+      // 4. Restore.
+      _showBusy('Restoring backup...');
+      try {
+        await VaultBackup.restoreBackup(
+          backupPath: path,
+          password: backupPw,
+          salt: _salt,
+          vaultRoot: await _storage.rootPath(),
+        );
+      } finally {
+        _hideBusy();
+      }
+
+      if (!mounted) return;
+      _snack('Vault restored from backup');
+      // The password may have changed: back to the lock screen.
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(
+            builder: (_) => const VaultLockScreen()),
+        (route) => route.isFirst,
+      );
+    } catch (e) {
+      if (mounted) _snack("Restore failed: $e");
+    }
   }
 
   // ------------------------------------------------------------------
@@ -633,6 +845,25 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
               ),
             ),
           ]),
+
+          if (!widget.decoy) ...[
+            _sectionTitle("Backup"),
+            _card([
+              _navTile(
+                icon: Icons.backup_outlined,
+                title: "Export encrypted backup",
+                subtitle:
+                    "Saves a .zip.enc copy of the whole vault",
+                onTap: _exportBackup,
+              ),
+              _navTile(
+                icon: Icons.restore_outlined,
+                title: "Restore from backup",
+                subtitle: "Replaces the current vault",
+                onTap: _restoreBackup,
+              ),
+            ]),
+          ],
 
           const SizedBox(height: 24),
           const Center(
