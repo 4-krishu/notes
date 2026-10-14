@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
@@ -62,6 +64,9 @@ class _AlbumScreenState extends State<AlbumScreen> {
   bool selectionMode = false;
   bool loading = true;
 
+  /// newest | oldest | name
+  String _sortMode = 'newest';
+
   late final String _salt;
 
   /// Files larger than this are skipped on import: encrypting them would
@@ -89,6 +94,9 @@ class _AlbumScreenState extends State<AlbumScreen> {
   void initState() {
     super.initState();
     _salt = VaultCrypto.getOrCreateSalt(Hive.box('settings'));
+    _sortMode = Hive.box('settings')
+            .get('vault_sort', defaultValue: 'newest')
+        as String;
     _loadMedia();
   }
 
@@ -249,8 +257,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
           .where((f) =>
               f.path.endsWith('.enc') &&
               !f.path.endsWith('.thumb.enc'))
-          .toList()
-        ..sort((a, b) => b.path.compareTo(a.path)); // newest first
+          .toList();
 
       final thumbPaths = allFiles
           .where((f) => f.path.endsWith('.thumb.enc'))
@@ -292,6 +299,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
       if (mounted) {
         setState(() {
           media = loaded;
+          _sortList();
           loading = false;
         });
       }
@@ -302,6 +310,27 @@ class _AlbumScreenState extends State<AlbumScreen> {
     } catch (_) {
       if (mounted) setState(() => loading = false);
     }
+  }
+
+  /// Sorts [media] in place according to [_sortMode]. Call inside setState.
+  void _sortList() {
+    switch (_sortMode) {
+      case 'oldest':
+        media.sort((a, b) => a.path.compareTo(b.path));
+        break;
+      case 'name':
+        media.sort((a, b) =>
+            a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+        break;
+      default: // newest
+        media.sort((a, b) => b.path.compareTo(a.path));
+    }
+  }
+
+  void _changeSort(String mode) {
+    _sortMode = mode;
+    Hive.box('settings').put('vault_sort', mode);
+    setState(_sortList);
   }
 
   Future<void> _generateMissingThumbs() async {
@@ -512,6 +541,29 @@ class _AlbumScreenState extends State<AlbumScreen> {
     );
   }
 
+  PopupMenuItem<String> _sortMenuItem(String value, String label) {
+    return PopupMenuItem(
+      value: value,
+      child: Row(
+        children: [
+          Icon(
+            _sortMode == value
+                ? Icons.check
+                : Icons.check_box_outline_blank,
+            size: 18,
+            color: VaultTheme.accent,
+          ),
+          const SizedBox(width: 10),
+          Text(
+            label,
+            style:
+                const TextStyle(color: VaultTheme.textPrimary),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ------------------------------------------------------------------
   // Opening files
   // ------------------------------------------------------------------
@@ -683,7 +735,19 @@ class _AlbumScreenState extends State<AlbumScreen> {
               tooltip: "Delete",
               onPressed: _deleteSelected,
             ),
-          ],
+          ] else
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.sort,
+                  color: VaultTheme.textPrimary),
+              tooltip: "Sort",
+              color: VaultTheme.surface,
+              onSelected: _changeSort,
+              itemBuilder: (_) => [
+                _sortMenuItem('newest', "Newest first"),
+                _sortMenuItem('oldest', "Oldest first"),
+                _sortMenuItem('name', "Name"),
+              ],
+            ),
         ],
       ),
       body: loading
@@ -791,12 +855,62 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
   bool _loadingFull = true;
   String? _loadError;
 
+  // Video controls.
+  bool _showControls = true;
+  Timer? _hideTimer;
+  bool _dragging = false;
+  double _dragValue = 0;
+  double _speed = 1.0;
+
+  // Image zoom.
+  final TransformationController _zoomController =
+      TransformationController();
+  bool _isZoomed = false;
+
   @override
   void initState() {
     super.initState();
     _current = widget.initialIndex;
     controller = PageController(initialPage: _current);
+    _zoomController.addListener(_onZoomChanged);
     _loadCurrent();
+  }
+
+  void _onZoomChanged() {
+    final zoomed =
+        _zoomController.value.getMaxScaleOnAxis() > 1.01;
+    if (zoomed != _isZoomed && mounted) {
+      setState(() => _isZoomed = zoomed);
+    }
+  }
+
+  void _toggleZoom() {
+    _zoomController.value = _isZoomed
+        ? Matrix4.identity()
+        : (Matrix4.identity()..scale(2.5));
+  }
+
+  void _onVideoTick() {
+    if (mounted && _showControls && !_dragging) setState(() {});
+  }
+
+  void _startHideTimer() {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _showControls = false);
+    });
+  }
+
+  void _toggleControls() {
+    setState(() => _showControls = !_showControls);
+    if (_showControls) _startHideTimer();
+  }
+
+  String _fmt(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
   Future<void> _loadCurrent() async {
@@ -805,8 +919,11 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
         _loadingFull = true;
         _fullBytes = null;
         _loadError = null;
+        _showControls = true;
+        _dragging = false;
       });
     }
+    _zoomController.value = Matrix4.identity();
     await _disposeVideo();
 
     try {
@@ -824,9 +941,12 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
         await File(path).writeAsBytes(plain, flush: true);
         _tempVideoPath = path;
         _videoController = VideoPlayerController.file(File(path));
+        _videoController!.addListener(_onVideoTick);
         await _videoController!.initialize();
         if (!mounted) return;
+        await _videoController!.setPlaybackSpeed(_speed);
         setState(() => _loadingFull = false);
+        _startHideTimer();
         await _videoController!.play();
       } else {
         setState(() {
@@ -844,9 +964,39 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
     }
   }
 
+  void _seekBy(int seconds) {
+    final c = _videoController;
+    if (c == null || !c.value.isInitialized) return;
+    final target = c.value.position + Duration(seconds: seconds);
+    final clamped = target < Duration.zero
+        ? Duration.zero
+        : (target > c.value.duration ? c.value.duration : target);
+    c.seekTo(clamped);
+  }
+
+  void _togglePlay() {
+    final c = _videoController;
+    if (c == null) return;
+    if (!c.value.isPlaying &&
+        c.value.position >= c.value.duration &&
+        c.value.duration > Duration.zero) {
+      c.seekTo(Duration.zero); // replay from start
+    }
+    setState(() {
+      if (c.value.isPlaying) {
+        c.pause();
+      } else {
+        c.play();
+      }
+    });
+    _startHideTimer();
+  }
+
   Future<void> _disposeVideo() async {
+    _videoController?.removeListener(_onVideoTick);
     await _videoController?.dispose();
     _videoController = null;
+    _hideTimer?.cancel();
     if (_tempVideoPath != null) {
       try {
         await File(_tempVideoPath!).delete();
@@ -859,9 +1009,309 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
 
   @override
   void dispose() {
+    _hideTimer?.cancel();
+    _zoomController.removeListener(_onZoomChanged);
+    _zoomController.dispose();
     controller.dispose();
     _disposeVideo();
     super.dispose();
+  }
+
+  // ------------------------------------------------------------------
+  // Info / delete
+  // ------------------------------------------------------------------
+
+  String _formatSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
+  Widget _infoRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 64,
+            child: Text(label,
+                style: const TextStyle(
+                    color: VaultTheme.textSecondary)),
+          ),
+          Expanded(
+            child: Text(value,
+                style: const TextStyle(
+                    color: VaultTheme.textPrimary)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showInfo() async {
+    final item = widget.items[_current];
+    String size = '—';
+    String modified = '—';
+    try {
+      final stat = await File(item.path).stat();
+      size = _formatSize(stat.size);
+      modified =
+          '${stat.modified.day}/${stat.modified.month}/${stat.modified.year}';
+    } catch (_) {}
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: VaultTheme.surface,
+        title: const Text('File info',
+            style:
+                TextStyle(color: VaultTheme.textPrimary)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _infoRow('Name', item.name),
+            _infoRow('Type', item.isVideo ? 'Video' : 'Photo'),
+            _infoRow('Size', size),
+            _infoRow('Added', modified),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close',
+                style: TextStyle(color: VaultTheme.accent)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _deleteCurrent() {
+    final item = widget.items[_current];
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: VaultTheme.surface,
+        title: const Text('Delete this file?',
+            style:
+                TextStyle(color: VaultTheme.textPrimary)),
+        content: const Text(
+          'This cannot be undone.',
+          style: TextStyle(color: VaultTheme.textSecondary),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(dialogContext);
+              try {
+                await File(item.path).delete();
+              } catch (_) {}
+              try {
+                await File(item.thumbPath).delete();
+              } catch (_) {}
+              widget.items.removeAt(_current);
+              if (!mounted) return;
+              if (widget.items.isEmpty) {
+                Navigator.pop(context);
+                return;
+              }
+              final needsJump = _current >= widget.items.length;
+              if (needsJump) {
+                _current = widget.items.length - 1;
+              }
+              setState(() {});
+              _loadCurrent();
+              if (needsJump) controller.jumpToPage(_current);
+            },
+            child: const Text('Delete',
+                style: TextStyle(color: VaultTheme.danger)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Build
+  // ------------------------------------------------------------------
+
+  Widget _buildImage() {
+    return GestureDetector(
+      onDoubleTap: _toggleZoom,
+      child: InteractiveViewer(
+        transformationController: _zoomController,
+        minScale: 1.0,
+        maxScale: 5.0,
+        child: Center(
+          child: _fullBytes != null
+              ? Image.memory(_fullBytes!)
+              : const SizedBox.shrink(),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildVideo() {
+    final c = _videoController;
+    if (c == null || !c.value.isInitialized) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final duration = c.value.duration;
+    final position = c.value.position;
+    final maxMs = max(1, duration.inMilliseconds).toDouble();
+    final sliderValue =
+        (_dragging ? _dragValue : position.inMilliseconds.toDouble())
+            .clamp(0.0, maxMs);
+
+    return GestureDetector(
+      onTap: _toggleControls,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Center(
+            child: AspectRatio(
+              aspectRatio: c.value.aspectRatio,
+              child: VideoPlayer(c),
+            ),
+          ),
+          if (_showControls) ...[
+            IconButton(
+              icon: Icon(
+                c.value.isPlaying
+                    ? Icons.pause_circle_filled
+                    : Icons.play_circle_filled,
+                color: Colors.white.withOpacity(0.9),
+                size: 64,
+              ),
+              onPressed: _togglePlay,
+            ),
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              // Absorb taps here so they don't toggle the controls.
+              child: GestureDetector(
+                onTap: () {},
+                behavior: HitTestBehavior.opaque,
+                child: Container(
+                padding:
+                    const EdgeInsets.fromLTRB(8, 24, 8, 12),
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.transparent,
+                      Colors.black87,
+                    ],
+                  ),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Slider(
+                      value: sliderValue,
+                      max: maxMs,
+                      activeColor: VaultTheme.accent,
+                      inactiveColor: Colors.white24,
+                      onChangeStart: (v) {
+                        _hideTimer?.cancel();
+                        setState(() {
+                          _dragging = true;
+                          _dragValue = v;
+                        });
+                      },
+                      onChanged: (v) =>
+                          setState(() => _dragValue = v),
+                      onChangeEnd: (v) {
+                        setState(() => _dragging = false);
+                        c.seekTo(Duration(
+                            milliseconds: v.toInt()));
+                        _startHideTimer();
+                      },
+                    ),
+                    Row(
+                      mainAxisAlignment:
+                          MainAxisAlignment.spaceBetween,
+                      children: [
+                        Padding(
+                          padding:
+                              const EdgeInsets.only(left: 14),
+                          child: Text(
+                            '${_fmt(_dragging ? Duration(milliseconds: _dragValue.toInt()) : position)} / ${_fmt(duration)}',
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12),
+                          ),
+                        ),
+                        Row(
+                          children: [
+                            IconButton(
+                              icon: const Icon(Icons.replay_10,
+                                  color: Colors.white),
+                              tooltip: 'Back 10s',
+                              onPressed: () => _seekBy(-10),
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.forward_10,
+                                  color: Colors.white),
+                              tooltip: 'Forward 10s',
+                              onPressed: () => _seekBy(10),
+                            ),
+                            PopupMenuButton<double>(
+                              icon: const Icon(Icons.speed,
+                                  color: Colors.white),
+                              tooltip: 'Playback speed',
+                              color: VaultTheme.surface,
+                              initialValue: _speed,
+                              onSelected: (v) {
+                                setState(() => _speed = v);
+                                c.setPlaybackSpeed(v);
+                              },
+                              itemBuilder: (_) => [
+                                0.5,
+                                1.0,
+                                1.5,
+                                2.0
+                              ]
+                                  .map(
+                                    (s) => PopupMenuItem(
+                                      value: s,
+                                      child: Text(
+                                        '${s}x',
+                                        style: const TextStyle(
+                                            color: VaultTheme
+                                                .textPrimary),
+                                      ),
+                                    ),
+                                  )
+                                  .toList(),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          ],
+        ],
+      ),
+    );
   }
 
   @override
@@ -869,13 +1319,31 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        backgroundColor: Colors.transparent,
+        backgroundColor: Colors.black54,
         iconTheme: const IconThemeData(color: Colors.white),
+        actions: [
+          if (!_loadingFull && _loadError == null) ...[
+            IconButton(
+              icon: const Icon(Icons.info_outline),
+              tooltip: 'File info',
+              onPressed: _showInfo,
+            ),
+            IconButton(
+              icon: const Icon(Icons.delete_outline),
+              tooltip: 'Delete',
+              onPressed: _deleteCurrent,
+            ),
+          ],
+        ],
       ),
       body: PageView.builder(
         controller: controller,
+        physics: _isZoomed
+            ? const NeverScrollableScrollPhysics()
+            : const PageScrollPhysics(),
         itemCount: widget.items.length,
         onPageChanged: (i) {
+          if (i == _current) return;
           _current = i;
           _loadCurrent();
         },
@@ -894,61 +1362,14 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
             return Center(
               child: Text(
                 _loadError!,
-                style: const TextStyle(color: Colors.white70),
+                style:
+                    const TextStyle(color: Colors.white70),
               ),
             );
           }
 
           final item = widget.items[i];
-
-          if (item.isVideo) {
-            if (_videoController != null &&
-                _videoController!.value.isInitialized) {
-              return Center(
-                child: AspectRatio(
-                  aspectRatio:
-                      _videoController!.value.aspectRatio,
-                  child: Stack(
-                    alignment: Alignment.bottomCenter,
-                    children: [
-                      VideoPlayer(_videoController!),
-                      Padding(
-                        padding:
-                            const EdgeInsets.only(bottom: 16),
-                        child: IconButton(
-                          icon: Icon(
-                            _videoController!.value.isPlaying
-                                ? Icons.pause_circle_filled
-                                : Icons.play_circle_filled,
-                            color: Colors.white,
-                            size: 48,
-                          ),
-                          onPressed: () {
-                            setState(() {
-                              if (_videoController!
-                                  .value.isPlaying) {
-                                _videoController!.pause();
-                              } else {
-                                _videoController!.play();
-                              }
-                            });
-                          },
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            }
-            return const Center(
-                child: CircularProgressIndicator());
-          }
-
-          return Center(
-            child: _fullBytes != null
-                ? Image.memory(_fullBytes!)
-                : const SizedBox.shrink(),
-          );
+          return item.isVideo ? _buildVideo() : _buildImage();
         },
       ),
     );
