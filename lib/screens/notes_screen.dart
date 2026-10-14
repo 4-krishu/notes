@@ -90,7 +90,6 @@ class _NotesScreenState extends State<NotesScreen> {
       ),
     );
   }
-
   void toggleArchive(Note note) {
     final isNowArchived = !note.isArchived;
 
@@ -294,43 +293,28 @@ class _NotesScreenState extends State<NotesScreen> {
                   const SizedBox(height: 6),
                   Expanded(
                     child: n.isChecklist && n.checklist != null
-                        ? Column(
-                            children: () {
-                              List<Widget> children = [];
-                              int totalItems = n.checklist!.length;
-                              int shownItems = totalItems > 2 ? 2 : totalItems;
-                              for (int i = 0; i < shownItems; i++) {
-                                var item = n.checklist![i];
-                                children.add(
-                                  Row(
-                                    children: [
-                                      Icon(
-                                        item["done"]
-                                            ? Icons.check_box
-                                            : Icons.check_box_outline_blank,
-                                        size: 16,
-                                      ),
-                                      Expanded(
-                                        child: Text(
-                                          item["text"],
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                        ),
-                                      ),
-                                    ],
+                        ? ListView.builder(
+                            primary: false,
+                            itemCount: n.checklist!.length,
+                            itemBuilder: (context, index) {
+                              final item = n.checklist![index];
+                              return Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Icon(
+                                    item["done"] == true
+                                        ? Icons.check_box
+                                        : Icons.check_box_outline_blank,
+                                    size: 16,
                                   ),
-                                );
-                              }
-                              if (totalItems > 2) {
-                                children.add(Text("+${totalItems - 2} more"));
-                              }
-                              return children;
-                            }(),
+                                  const SizedBox(width: 4),
+                                  Expanded(child: Text(item["text"] ?? "")),
+                                ],
+                              );
+                            },
                           )
-                        : Text(
-                            n.content,
-                            maxLines: 5,
-                            overflow: TextOverflow.ellipsis,
+                        : SingleChildScrollView(
+                            child: Text(n.content),
                           ),
                   ),
                   Row(

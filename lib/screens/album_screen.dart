@@ -92,6 +92,11 @@ class _AlbumScreenState extends State<AlbumScreen> {
       selectionMode = true;
     });
   }
+// develop of the point and the other are for the security
+// cool of the system and the vessels are the true form.
+// the delete of the file.
+// only the few systems will be the reason for the delete
+// and the system will be wordk as the reason for all the class
 
   void _deleteSelected() {
     for (var i in selectedIndexes) {
@@ -205,7 +210,8 @@ class _AlbumScreenState extends State<AlbumScreen> {
     );
   }
 }
-
+// Full screen viewwer for the screen will be play for the reasonat and allow for user
+// and the other facor will be the video and the image will be shown in the call
 class FullScreenViewer extends StatefulWidget {
   final List<File> media;
   final int initialIndex;
