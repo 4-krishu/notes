@@ -19,7 +19,7 @@ class VaultTheme {
     return BoxDecoration(
       color: surface,
       borderRadius: BorderRadius.circular(cardRadius),
-      border: Border.all(color: Colors.white.withOpacity(0.06)),
+      border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
     );
   }
 
