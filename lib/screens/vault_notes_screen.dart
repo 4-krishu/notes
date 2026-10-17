@@ -9,7 +9,7 @@ import '../security/vault_crypto.dart';
 import '../security/vault_storage.dart';
 import 'vault_theme.dart';
 
-/// One encrypted vault text note. Stored as "<id>.note.enc" inside the
+/// One encrypted vault text note. Stored as `"<id>.note.enc"` inside the
 /// vault's hidden .notes/ folder; the JSON payload is AES-encrypted with
 /// the vault password, exactly like files.
 class _VaultNote {
