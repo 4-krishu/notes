@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -20,13 +21,15 @@ import 'vault_theme.dart';
 /// In decoy mode the sensitive sections (decoy password, intruder log,
 /// backup) are hidden so the fake vault looks ordinary.
 class VaultSettingsScreen extends StatefulWidget {
-  final String password;
+  /// Vault AES key, derived once at unlock (see VaultCrypto.deriveKey).
+  /// Kept in memory only, never persisted.
+  final Uint8List vaultKey;
   final bool decoy;
-  final void Function(String newPassword) onPasswordChanged;
+  final void Function(Uint8List newKey) onPasswordChanged;
 
   const VaultSettingsScreen({
     super.key,
-    required this.password,
+    required this.vaultKey,
     required this.decoy,
     required this.onPasswordChanged,
   });
@@ -38,7 +41,7 @@ class VaultSettingsScreen extends StatefulWidget {
 class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
   late Box settingsBox;
   late String _salt;
-  late String _password;
+  late Uint8List _vaultKey;
   late VaultStorage _storage;
 
   bool _bioSupported = false;
@@ -59,7 +62,7 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
   @override
   void initState() {
     super.initState();
-    _password = widget.password;
+    _vaultKey = widget.vaultKey;
     _storage = VaultStorage(decoy: widget.decoy);
     settingsBox = Hive.box('settings');
     _salt = VaultCrypto.getOrCreateSalt(settingsBox);
@@ -214,8 +217,7 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
       try {
         path = await VaultBackup.exportBackup(
           vaultRoot: await _storage.rootPath(),
-          password: _password,
-          salt: _salt,
+          vaultKey: _vaultKey,
           targetDir: dir,
         );
       } finally {
@@ -248,6 +250,7 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
       if (backupPw == null || backupPw.isEmpty) return;
 
       // 2. Decrypt the manifest (fails loudly on a wrong password).
+      // Accepts backups made before Phase B (legacy key) too.
       _showBusy('Reading backup...');
       late final Map<String, dynamic> manifest;
       try {
@@ -325,10 +328,23 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
         if (mounted) _snack("Biometric authentication failed");
         return;
       }
-      // Store the password in the OS keystore so a biometric success can
-      // unlock the vault without asking for the password.
+      // The settings screen never holds the plaintext password (only the
+      // derived key), so ask for it once: it is stored in the OS keystore
+      // so a biometric success can unlock the vault later.
+      final pw = await _askText(
+        title: 'Confirm password',
+        label: 'Current vault password',
+        obscure: true,
+      );
+      if (pw == null || pw.isEmpty) return;
+      final verified = await VaultCrypto.verifyPasswordAsync(
+          pw, _salt, settingsBox.get(VaultCrypto.passwordHashKey) as String? ?? '');
+      if (verified == null) {
+        if (mounted) _snack("Wrong password");
+        return;
+      }
       await const FlutterSecureStorage()
-          .write(key: _securePwKey, value: _password);
+          .write(key: _securePwKey, value: pw);
       if (mounted) _snack("Biometric unlock enabled");
     } else {
       await const FlutterSecureStorage().delete(key: _securePwKey);
@@ -410,13 +426,18 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
             child: const Text("Cancel"),
           ),
           TextButton(
-            onPressed: () {
+            onPressed: () async {
               final current = currentCtrl.text.trim();
               final newPw = newCtrl.text.trim();
               final confirm = confirmCtrl.text.trim();
 
-              if (VaultCrypto.hashPassword(current, _salt) !=
-                  settingsBox.get(VaultCrypto.passwordHashKey)) {
+              final currentOk = await VaultCrypto.verifyPasswordAsync(
+                  current,
+                  _salt,
+                  settingsBox.get(VaultCrypto.passwordHashKey)
+                          as String? ??
+                      '');
+              if (currentOk == null) {
                 _snack("Wrong current password");
                 return;
               }
@@ -428,7 +449,11 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
                 _snack("Decoy passwords do not match");
                 return;
               }
-              if (VaultCrypto.hashPassword(newPw, _salt) ==
+              // One background derivation (~1s); reuse it for both the
+              // comparison and the stored hash.
+              final newDecoyHash = VaultCrypto.hashKey(
+                  await VaultCrypto.deriveKeyAsync(newPw, _salt));
+              if (newDecoyHash ==
                   settingsBox.get(VaultCrypto.passwordHashKey)) {
                 _snack("Decoy password must differ from the real one");
                 return;
@@ -436,7 +461,7 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
 
               VaultPrefs.setString(
                 VaultPrefs.decoyHash,
-                VaultCrypto.hashPassword(newPw, _salt),
+                newDecoyHash,
               );
               disposeAll();
               Navigator.pop(dialogContext);
@@ -591,21 +616,23 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
                 ),
               );
 
+              // The loading dialog is already up; derive off the UI thread.
+              final newKey =
+                  await VaultCrypto.deriveKeyAsync(newPw, _salt);
               try {
                 final root = await _storage.rootPath();
-                await VaultCrypto.changePassword(
+                await VaultCrypto.rekey(
                   vaultRoot: root,
-                  oldPassword: current,
-                  newPassword: newPw,
-                  salt: _salt,
+                  oldKey: _vaultKey,
+                  newKey: newKey,
                 );
                 if (widget.decoy) {
                   VaultPrefs.setString(VaultPrefs.decoyHash,
-                      VaultCrypto.hashPassword(newPw, _salt));
+                      VaultCrypto.hashKey(newKey));
                 } else {
                   settingsBox.put(
                     VaultCrypto.passwordHashKey,
-                    VaultCrypto.hashPassword(newPw, _salt),
+                    VaultCrypto.hashKey(newKey),
                   );
                   if (VaultPrefs.getBool(
                       VaultPrefs.biometricEnabled)) {
@@ -613,8 +640,8 @@ class _VaultSettingsScreenState extends State<VaultSettingsScreen> {
                         key: _securePwKey, value: newPw);
                   }
                 }
-                setState(() => _password = newPw);
-                widget.onPasswordChanged(newPw);
+                setState(() => _vaultKey = newKey);
+                widget.onPasswordChanged(newKey);
                 disposeAll();
                 if (mounted) {
                   Navigator.pop(context); // loading
