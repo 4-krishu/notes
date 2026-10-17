@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:hive/hive.dart';
 
 import '../security/vault_storage.dart';
 import '../security/vault_trash.dart';
@@ -52,6 +53,20 @@ class _VaultTrashScreenState extends State<VaultTrashScreen> {
           return widget.storage.albumDir(album);
         },
       );
+      // If the album was deleted after the file was trashed, the restored
+      // file would land in a folder the home screen never lists. Re-add
+      // the album name so it becomes visible again.
+      if (item.album != '.notes') {
+        final box = Hive.box('settings');
+        final key = widget.storage.albumsKey;
+        final albums = List<String>.from(
+          box.get(key, defaultValue: const <String>[]),
+        );
+        if (!albums.contains(item.album)) {
+          albums.add(item.album);
+          box.put(key, albums);
+        }
+      }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text("Restored to ${item.album}")),
