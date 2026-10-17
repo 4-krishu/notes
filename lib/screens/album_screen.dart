@@ -21,7 +21,7 @@ import 'vault_theme.dart';
 /// One vault item. The grid only ever holds the small thumbnail bytes;
 /// the full file is decrypted on demand when opened. This keeps memory
 /// bounded no matter how many photos the album holds.
-class _VaultFile {
+class VaultFile {
   final String path; // encrypted full file: <base>.enc
   final String name; // display name without the .enc suffix
   final String ext; // original extension, e.g. ".jpg"
@@ -31,7 +31,7 @@ class _VaultFile {
   bool isFavorite;
   Uint8List? thumbBytes; // decrypted thumbnail (null until loaded)
 
-  _VaultFile({
+  VaultFile({
     required this.path,
     required this.name,
     required this.ext,
@@ -44,7 +44,7 @@ class _VaultFile {
 
   bool get isDocument => !isVideo && !isImage;
 
-  /// "<dir>/X.jpg.enc" -> "<dir>/X.jpg.thumb.enc"
+  /// `"<dir>/X.jpg.enc"` -> `"<dir>/X.jpg.thumb.enc"`
   String get thumbPath =>
       '${path.substring(0, path.length - '.enc'.length)}.thumb.enc';
 }
@@ -70,7 +70,7 @@ class AlbumScreen extends StatefulWidget {
 }
 
 class _AlbumScreenState extends State<AlbumScreen> {
-  List<_VaultFile> media = [];
+  List<VaultFile> media = [];
   Set<int> selectedIndexes = {};
 
   bool selectionMode = false;
@@ -117,8 +117,8 @@ class _AlbumScreenState extends State<AlbumScreen> {
   /// (mediaIndex, file) pairs visible under the current filter.
   /// Selection indexes always refer to [media], so filtering never
   /// breaks selection, delete or move.
-  List<MapEntry<int, _VaultFile>> get _visible {
-    final out = <MapEntry<int, _VaultFile>>[];
+  List<MapEntry<int, VaultFile>> get _visible {
+    final out = <MapEntry<int, VaultFile>>[];
     for (var i = 0; i < media.length; i++) {
       if (!_showFavoritesOnly || media[i].isFavorite) {
         out.add(MapEntry(i, media[i]));
@@ -325,7 +325,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
       final favIds =
           VaultPrefs.getStringList(VaultPrefs.favorites).toSet();
 
-      final loaded = <_VaultFile>[];
+      final loaded = <VaultFile>[];
       for (final file in fullFiles) {
         final fileName = file.path.split('/').last;
         final name =
@@ -352,7 +352,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
           }
         }
 
-        loaded.add(_VaultFile(
+        loaded.add(VaultFile(
           path: file.path,
           name: name,
           ext: ext,
@@ -708,7 +708,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
   }
 
   /// Decrypts a document to a temp file and opens it with an external app.
-  Future<void> _openDocument(_VaultFile item) async {
+  Future<void> _openDocument(VaultFile item) async {
     try {
       final tmp = await getTemporaryDirectory();
       final path =
@@ -731,7 +731,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
   // UI
   // ------------------------------------------------------------------
 
-  Widget _buildTile(_VaultFile file, bool selected) {
+  Widget _buildTile(VaultFile file, bool selected) {
     Widget content;
     if (file.isVideo && file.thumbBytes != null) {
       content = Stack(
@@ -821,7 +821,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
               ),
             if (selected)
               Container(
-                color: VaultTheme.accent.withOpacity(0.25),
+                color: VaultTheme.accent.withValues(alpha: 0.25),
                 child: const Align(
                   alignment: Alignment.topRight,
                   child: Padding(
@@ -1049,7 +1049,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
 /// currently visible page only; images show from memory, videos via a
 /// temporary file that is deleted on close.
 class FullScreenViewer extends StatefulWidget {
-  final List<_VaultFile> items;
+  final List<VaultFile> items;
   final int initialIndex;
   final String password;
   final String salt;
@@ -1112,7 +1112,7 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
   void _toggleZoom() {
     _zoomController.value = _isZoomed
         ? Matrix4.identity()
-        : (Matrix4.identity()..scale(2.5));
+        : (Matrix4.identity()..scaleByDouble(2.5, 2.5, 1.0, 1.0));
   }
 
   void _onVideoTick() {
@@ -1423,7 +1423,7 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
                 c.value.isPlaying
                     ? Icons.pause_circle_filled
                     : Icons.play_circle_filled,
-                color: Colors.white.withOpacity(0.9),
+                color: Colors.white.withValues(alpha: 0.9),
                 size: 64,
               ),
               onPressed: _togglePlay,
