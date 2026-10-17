@@ -52,8 +52,9 @@ class VaultFile {
 class AlbumScreen extends StatefulWidget {
   final String albumName;
 
-  /// Vault password, kept in memory only. Used to encrypt/decrypt files.
-  final String password;
+  /// Vault AES key, derived once at unlock (see VaultCrypto.deriveKey).
+  /// Kept in memory only, never persisted.
+  final Uint8List vaultKey;
 
   /// When true, operate inside the decoy vault instead of the real one.
   final bool decoy;
@@ -61,7 +62,7 @@ class AlbumScreen extends StatefulWidget {
   const AlbumScreen({
     super.key,
     required this.albumName,
-    required this.password,
+    required this.vaultKey,
     this.decoy = false,
   });
 
@@ -80,7 +81,6 @@ class _AlbumScreenState extends State<AlbumScreen> {
   /// newest | oldest | name | size
   String _sortMode = 'newest';
 
-  late final String _salt;
   late final VaultStorage _storage;
 
   /// Files larger than this are skipped on import: encrypting them would
@@ -108,7 +108,6 @@ class _AlbumScreenState extends State<AlbumScreen> {
   void initState() {
     super.initState();
     _storage = VaultStorage(decoy: widget.decoy);
-    _salt = VaultCrypto.getOrCreateSalt(Hive.box('settings'));
     _sortMode = Hive.box('settings')
         .get(_storage.sortKey, defaultValue: 'newest') as String;
     _loadMedia();
@@ -248,8 +247,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
         if (_imageExts.contains(ext)) {
           final thumb = _makeThumbnail(plain);
           if (thumb != null) {
-            final encThumb = VaultCrypto.encryptBytes(
-                thumb, widget.password, _salt);
+            final encThumb = VaultCrypto.encryptBytes(thumb, widget.vaultKey);
             await File('$vaultPath/$base.thumb.enc')
                 .writeAsBytes(encThumb, flush: true);
           }
@@ -260,24 +258,19 @@ class _AlbumScreenState extends State<AlbumScreen> {
         if (_videoExts.contains(ext)) {
           final vthumb = await _makeVideoThumbnail(original.path);
           if (vthumb != null) {
-            final encThumb = VaultCrypto.encryptBytes(
-                vthumb, widget.password, _salt);
+            final encThumb = VaultCrypto.encryptBytes(vthumb, widget.vaultKey);
             await File('$vaultPath/$base.thumb.enc')
                 .writeAsBytes(encThumb, flush: true);
           }
         }
 
         final encrypted =
-            VaultCrypto.encryptBytes(plain, widget.password, _salt);
+            VaultCrypto.encryptBytes(plain, widget.vaultKey);
         await File(destPath).writeAsBytes(encrypted, flush: true);
 
         // Verify the encrypted file decrypts back to identical bytes
         // BEFORE deleting the original. Never delete first.
-        final roundTrip = VaultCrypto.decryptBytes(
-          await File(destPath).readAsBytes(),
-          widget.password,
-          _salt,
-        );
+        final roundTrip = VaultCrypto.decryptBytes(await File(destPath).readAsBytes(), widget.vaultKey);
         if (!VaultCrypto.bytesEqual(roundTrip, plain)) {
           throw const FormatException('Encryption verification failed');
         }
@@ -342,11 +335,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
         Uint8List? thumbBytes;
         if (thumbPaths.contains(tp)) {
           try {
-            thumbBytes = VaultCrypto.decryptBytes(
-              await File(tp).readAsBytes(),
-              widget.password,
-              _salt,
-            );
+            thumbBytes = VaultCrypto.decryptBytes(await File(tp).readAsBytes(), widget.vaultKey);
           } catch (_) {
             // Corrupt thumbnail; will be regenerated below.
           }
@@ -412,14 +401,12 @@ class _AlbumScreenState extends State<AlbumScreen> {
         Uint8List? thumb;
         if (item.isImage) {
           final data = await File(item.path).readAsBytes();
-          final plain = VaultCrypto.decryptBytes(
-              data, widget.password, _salt);
+          final plain = VaultCrypto.decryptBytes(data, widget.vaultKey);
           thumb = _makeThumbnail(plain);
         } else {
           // Video: decrypt to a temp file, extract a frame, clean up.
           final data = await File(item.path).readAsBytes();
-          final plain = VaultCrypto.decryptBytes(
-              data, widget.password, _salt);
+          final plain = VaultCrypto.decryptBytes(data, widget.vaultKey);
           final tmp = await getTemporaryDirectory();
           final tmpPath =
               '${tmp.path}/vault_vthumb_${DateTime.now().millisecondsSinceEpoch}${item.ext}';
@@ -430,8 +417,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
           } catch (_) {}
         }
         if (thumb == null) continue;
-        final encThumb = VaultCrypto.encryptBytes(
-            thumb, widget.password, _salt);
+        final encThumb = VaultCrypto.encryptBytes(thumb, widget.vaultKey);
         await File(item.thumbPath)
             .writeAsBytes(encThumb, flush: true);
         item.thumbBytes = thumb;
@@ -697,8 +683,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
           builder: (_) => FullScreenViewer(
             items: media,
             initialIndex: mediaIndex,
-            password: widget.password,
-            salt: _salt,
+            vaultKey: widget.vaultKey,
             storage: _storage,
             albumName: widget.albumName,
           ),
@@ -715,7 +700,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
           '${tmp.path}/vault_doc_${DateTime.now().millisecondsSinceEpoch}${item.ext}';
       final data = await File(item.path).readAsBytes();
       final plain =
-          VaultCrypto.decryptBytes(data, widget.password, _salt);
+          VaultCrypto.decryptBytes(data, widget.vaultKey);
       await File(path).writeAsBytes(plain, flush: true);
       await OpenFilex.open(path);
     } catch (e) {
@@ -1051,8 +1036,9 @@ class _AlbumScreenState extends State<AlbumScreen> {
 class FullScreenViewer extends StatefulWidget {
   final List<VaultFile> items;
   final int initialIndex;
-  final String password;
-  final String salt;
+
+  /// Vault AES key, derived once at unlock (see VaultCrypto.deriveKey).
+  final Uint8List vaultKey;
   final VaultStorage storage;
   final String albumName;
 
@@ -1060,8 +1046,7 @@ class FullScreenViewer extends StatefulWidget {
     super.key,
     required this.items,
     required this.initialIndex,
-    required this.password,
-    required this.salt,
+    required this.vaultKey,
     required this.storage,
     required this.albumName,
   });
@@ -1154,8 +1139,7 @@ class _FullScreenViewerState extends State<FullScreenViewer> {
     try {
       final item = widget.items[_current];
       final data = await File(item.path).readAsBytes();
-      final plain = VaultCrypto.decryptBytes(
-          data, widget.password, widget.salt);
+      final plain = VaultCrypto.decryptBytes(data, widget.vaultKey);
       if (!mounted) return;
 
       if (item.isVideo) {
