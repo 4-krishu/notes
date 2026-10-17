@@ -131,6 +131,16 @@ class _NotesScreenState extends State<NotesScreen> {
     List<TextEditingController> items = [TextEditingController()];
     List<FocusNode> focusNodes = [FocusNode()];
 
+    void disposeSheetControllers() {
+      titleController.dispose();
+      for (final c in items) {
+        c.dispose();
+      }
+      for (final f in focusNodes) {
+        f.dispose();
+      }
+    }
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -219,7 +229,7 @@ class _NotesScreenState extends State<NotesScreen> {
           },
         );
       },
-    );
+    ).then((_) => disposeSheetControllers());
   }
 
   Widget _buildBody() {
