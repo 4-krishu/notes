@@ -26,9 +26,10 @@ class _SearchHit {
 }
 
 class VaultHomeScreen extends StatefulWidget {
-  /// Vault password, kept in memory only. Used to encrypt/decrypt files.
-  /// Never persisted.
-  final String password;
+  /// Vault AES key, derived once at unlock via PBKDF2 (see VaultCrypto).
+  /// Kept in memory only, never persisted. Passed down to every vault
+  /// screen so the slow derivation runs once per unlock, not per file.
+  final Uint8List vaultKey;
 
   /// When true, this screen shows the decoy vault (separate directory,
   /// separate album list) instead of the real one.
@@ -36,7 +37,7 @@ class VaultHomeScreen extends StatefulWidget {
 
   const VaultHomeScreen({
     super.key,
-    required this.password,
+    required this.vaultKey,
     this.decoy = false,
   });
 
@@ -47,11 +48,10 @@ class VaultHomeScreen extends StatefulWidget {
 class _VaultHomeScreenState extends State<VaultHomeScreen>
     with WidgetsBindingObserver {
   late Box settingsBox;
-  late String _salt;
   late VaultStorage _storage;
 
-  /// In-memory password; updated after a successful password change.
-  late String _password;
+  /// In-memory vault key; updated after a successful password change.
+  late Uint8List _vaultKey;
 
   List<String> albums = [];
   Map<String, int> itemCounts = {};
@@ -80,10 +80,9 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
   @override
   void initState() {
     super.initState();
-    _password = widget.password;
+    _vaultKey = widget.vaultKey;
     _storage = VaultStorage(decoy: widget.decoy);
     settingsBox = Hive.box('settings');
-    _salt = VaultCrypto.getOrCreateSalt(settingsBox);
     // Albums are persisted so they survive app restarts.
     albums = List<String>.from(
       settingsBox.get(
@@ -233,11 +232,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
             .toList();
         if (thumbs.isNotEmpty) {
           try {
-            newCovers[name] = VaultCrypto.decryptBytes(
-              await thumbs.first.readAsBytes(),
-              _password,
-              _salt,
-            );
+            newCovers[name] = VaultCrypto.decryptBytes(await thumbs.first.readAsBytes(), _vaultKey);
           } catch (_) {
             // Skip unreadable files.
           }
@@ -613,9 +608,10 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
       context,
       MaterialPageRoute(
         builder: (_) => VaultSettingsScreen(
-          password: _password,
+          vaultKey: _vaultKey,
           decoy: widget.decoy,
-          onPasswordChanged: (np) => setState(() => _password = np),
+          onPasswordChanged: (Uint8List nk) =>
+              setState(() => _vaultKey = nk),
         ),
       ),
     ).then((_) => _refresh());
@@ -635,7 +631,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
       context,
       MaterialPageRoute(
         builder: (_) => VaultNotesScreen(
-          password: _password,
+          vaultKey: _vaultKey,
           decoy: widget.decoy,
         ),
       ),
@@ -657,7 +653,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
       MaterialPageRoute(
         builder: (_) => AlbumScreen(
           albumName: name,
-          password: _password,
+          vaultKey: _vaultKey,
           decoy: widget.decoy,
         ),
       ),
