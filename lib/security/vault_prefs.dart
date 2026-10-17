@@ -21,7 +21,7 @@ class VaultPrefs {
   static const String sortMode = 'vault_sort';
   static const String decoySortMode = 'vault_decoy_sort';
 
-  /// Favorite file ids: "<v|d>:<encrypted file name>", e.g. "v:1730000_0.jpg.enc".
+  /// Favorite file ids: `"<v|d>:<encrypted file name>"`, e.g. `"v:1730000_0.jpg.enc"`.
   static const String favorites = 'vault_favorites';
 
   /// Trash metadata: { trashFileName: {album, deletedAt, kind} }.
