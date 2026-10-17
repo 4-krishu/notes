@@ -3,7 +3,6 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:hive/hive.dart';
 
 import '../security/vault_crypto.dart';
 import '../security/vault_storage.dart';
@@ -29,12 +28,13 @@ class _VaultNote {
 }
 
 class VaultNotesScreen extends StatefulWidget {
-  final String password;
+  /// Vault AES key, derived once at unlock (see VaultCrypto.deriveKey).
+  final Uint8List vaultKey;
   final bool decoy;
 
   const VaultNotesScreen({
     super.key,
-    required this.password,
+    required this.vaultKey,
     this.decoy = false,
   });
 
@@ -44,7 +44,6 @@ class VaultNotesScreen extends StatefulWidget {
 
 class _VaultNotesScreenState extends State<VaultNotesScreen> {
   late final VaultStorage _storage;
-  late final String _salt;
 
   List<_VaultNote> notes = [];
   bool loading = true;
@@ -53,7 +52,6 @@ class _VaultNotesScreenState extends State<VaultNotesScreen> {
   void initState() {
     super.initState();
     _storage = VaultStorage(decoy: widget.decoy);
-    _salt = VaultCrypto.getOrCreateSalt(Hive.box('settings'));
     _load();
   }
 
@@ -65,11 +63,7 @@ class _VaultNotesScreenState extends State<VaultNotesScreen> {
       await for (final e in dir.list()) {
         if (e is! File || !e.path.endsWith('.note.enc')) continue;
         try {
-          final plain = VaultCrypto.decryptBytes(
-            await e.readAsBytes(),
-            widget.password,
-            _salt,
-          );
+          final plain = VaultCrypto.decryptBytes(await e.readAsBytes(), widget.vaultKey);
           final map =
               jsonDecode(utf8.decode(plain)) as Map<String, dynamic>;
           final fileName = e.path.split('/').last;
@@ -101,11 +95,7 @@ class _VaultNotesScreenState extends State<VaultNotesScreen> {
       'body': note.body,
       'updatedAt': note.updatedAt,
     });
-    final enc = VaultCrypto.encryptBytes(
-      Uint8List.fromList(utf8.encode(jsonStr)),
-      widget.password,
-      _salt,
-    );
+    final enc = VaultCrypto.encryptBytes(Uint8List.fromList(utf8.encode(jsonStr)), widget.vaultKey);
     await File('${dir.path}/${note.fileName}')
         .writeAsBytes(enc, flush: true);
   }
