@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -30,6 +31,9 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
 
   bool isFirstTime = false;
   bool obscure = true;
+
+  /// True while a (slow) PBKDF2 derivation runs in the background.
+  bool _unlocking = false;
 
   String? savedHash;
   String? savedQuestion;
@@ -163,7 +167,9 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
       return;
     }
     // The stored password may be stale (e.g. changed on another screen).
-    if (VaultCrypto.hashPassword(stored, salt) != savedHash) {
+    final verified = await VaultCrypto.verifyPasswordAsync(
+        stored, salt, savedHash ?? '');
+    if (verified == null) {
       await _secureStorage.delete(key: _securePwKey);
       if (mounted) {
         _showSnack("Saved unlock is outdated — enter your password");
@@ -171,16 +177,17 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
       return;
     }
 
-    VaultPrefs.setInt(VaultPrefs.failedAttempts, 0);
-    VaultPrefs.setInt(VaultPrefs.lockoutUntilMs, 0);
-    _openVault(stored, decoy: false);
+    await _finishUnlock(stored, verified.key, verified.wasLegacy,
+        decoy: false);
   }
 
   // ------------------------------------------------------------------
-  // Password submit: real password, decoy password, or wrong attempt
+  // Password submit: real password, decoy password, or wrong attempt.
+  // Accepts both the current PBKDF2 hashes and legacy pre-Phase-B hashes;
+  // a legacy match triggers a one-time transparent key migration.
   // ------------------------------------------------------------------
 
-  void _submit() {
+  Future<void> _submit() async {
     final pass = _passwordController.text.trim();
     final confirm = _confirmController.text.trim();
 
@@ -202,18 +209,30 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
         return;
       }
 
-      // Store only hashes, never the plaintext password/answer.
-      settingsBox.put(
-        VaultCrypto.passwordHashKey,
-        VaultCrypto.hashPassword(pass, salt),
-      );
-      settingsBox.put('vault_question', selectedQuestion);
-      settingsBox.put(
-        VaultCrypto.answerHashKey,
-        VaultCrypto.hashAnswer(_answerController.text, salt),
-      );
-
-      _openVault(pass, decoy: false);
+      setState(() => _unlocking = true);
+      try {
+        final answerText = _answerController.text;
+        // Derive both in the background (each ~1s); the spinner is up.
+        final results = await Future.wait([
+          VaultCrypto.deriveKeyAsync(pass, salt),
+          VaultCrypto.deriveKeyAsync(
+              answerText.trim().toLowerCase(), salt),
+        ]);
+        final key = results[0];
+        // Store only hashes, never the plaintext password/answer.
+        settingsBox.put(
+          VaultCrypto.passwordHashKey,
+          VaultCrypto.hashKey(key),
+        );
+        settingsBox.put('vault_question', selectedQuestion);
+        settingsBox.put(
+          VaultCrypto.answerHashKey,
+          VaultCrypto.hashKey(results[1]),
+        );
+        _openVault(key, decoy: false);
+      } finally {
+        if (mounted) setState(() => _unlocking = false);
+      }
       return;
     }
 
@@ -225,17 +244,103 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
       return;
     }
 
-    final hash = VaultCrypto.hashPassword(pass, salt);
-    if (hash == savedHash) {
-      _onSuccessfulUnlock(pass, decoy: false);
-    } else if (decoyHash != null && hash == decoyHash) {
-      _onSuccessfulUnlock(pass, decoy: true);
-    } else {
-      _onWrongPassword();
+    // PBKDF2 verification takes ~1s: run it off the UI thread with the
+    // button showing a spinner. The legacy path is microseconds.
+    setState(() => _unlocking = true);
+    try {
+      final verified = await VaultCrypto.verifyPasswordAsync(
+          pass, salt, savedHash ?? '');
+      if (verified != null) {
+        await _finishUnlock(pass, verified.key, verified.wasLegacy,
+            decoy: false);
+        return;
+      }
+      if (decoyHash != null) {
+        final decoyVerified =
+            await VaultCrypto.verifyPasswordAsync(pass, salt, decoyHash!);
+        if (decoyVerified != null) {
+          await _finishUnlock(pass, decoyVerified.key,
+              decoyVerified.wasLegacy,
+              decoy: true);
+          return;
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _unlocking = false);
+    }
+    _onWrongPassword();
+  }
+
+  /// Common post-verification path for password and biometric unlocks.
+  /// When the stored hash used the legacy pre-Phase-B scheme, every vault
+  /// file is re-encrypted to the new stretched key first (one-time).
+  Future<void> _finishUnlock(
+    String pass,
+    Uint8List key,
+    bool wasLegacy, {
+    required bool decoy,
+  }) async {
+    if (wasLegacy) {
+      _showUpgradingDialog();
+      try {
+        final docs = await getApplicationDocumentsDirectory();
+        final root =
+            decoy ? '${docs.path}/vault_decoy' : '${docs.path}/vault';
+        await VaultCrypto.rekey(
+          vaultRoot: root,
+          oldKey: VaultCrypto.deriveKeyLegacy(pass, salt),
+          newKey: key,
+        );
+        // Store the new-scheme hash going forward.
+        final newHash = VaultCrypto.hashPassword(pass, salt);
+        if (decoy) {
+          VaultPrefs.setString(VaultPrefs.decoyHash, newHash);
+          decoyHash = newHash;
+        } else {
+          settingsBox.put(VaultCrypto.passwordHashKey, newHash);
+          savedHash = newHash;
+        }
+      } catch (e) {
+        if (mounted) {
+          Navigator.pop(context); // close upgrading dialog
+          _showSnack("Security upgrade failed: $e");
+        }
+        return;
+      }
+      if (mounted) Navigator.pop(context); // close upgrading dialog
+    }
+
+    _onSuccessfulUnlock(pass, key, decoy: decoy);
+  }
+
+  /// Blocking "upgrading" dialog shown during the one-time key migration.
+  /// The caller closes it via Navigator.pop.
+  void _showUpgradingDialog() {
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => AlertDialog(
+          backgroundColor: VaultTheme.surface,
+          content: const Row(
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(width: 16),
+              Expanded(
+                child: Text(
+                  "Upgrading vault security…",
+                  style: TextStyle(color: VaultTheme.textPrimary),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
     }
   }
 
-  void _onSuccessfulUnlock(String pass, {required bool decoy}) {
+  void _onSuccessfulUnlock(String pass, Uint8List key,
+      {required bool decoy}) {
     VaultPrefs.setInt(VaultPrefs.failedAttempts, 0);
     VaultPrefs.setInt(VaultPrefs.lockoutUntilMs, 0);
     // Keep the secure-storage copy in sync so biometric unlock keeps
@@ -247,7 +352,7 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
         _secureStorage.delete(key: _securePwKey);
       }
     }
-    _openVault(pass, decoy: decoy);
+    _openVault(key, decoy: decoy);
   }
 
   void _onWrongPassword() {
@@ -316,13 +421,14 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
     }
   }
 
-  void _openVault(String password, {required bool decoy}) {
-    // The plaintext password lives in memory only, for file encryption.
+  void _openVault(Uint8List vaultKey, {required bool decoy}) {
+    // The derived key lives in memory only, for file encryption.
+    // The plaintext password is never passed beyond the lock screen.
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(
         builder: (_) => VaultHomeScreen(
-          password: password,
+          vaultKey: vaultKey,
           decoy: decoy,
         ),
       ),
@@ -366,9 +472,18 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
             TextButton(
               onPressed: () async {
                 final input = _answerController.text.trim();
-                final ok = input.isNotEmpty &&
-                    VaultCrypto.hashAnswer(input, salt) == savedAnswerHash;
-                if (ok) {
+                final checked = await VaultCrypto.verifyAnswerAsync(
+                    input, salt, savedAnswerHash);
+                if (checked.ok) {
+                  // Upgrade a legacy answer hash to the PBKDF2 scheme.
+                  if (checked.wasLegacy) {
+                    settingsBox.put(
+                      VaultCrypto.answerHashKey,
+                      VaultCrypto.hashAnswer(input, salt),
+                    );
+                    savedAnswerHash = settingsBox
+                        .get(VaultCrypto.answerHashKey) as String?;
+                  }
                   // Wipe the old hash; the fresh lock screen will ask for
                   // a new password (isFirstTime == true). Biometric unlock
                   // is disabled too: its stored password is now stale.
@@ -509,10 +624,19 @@ class _VaultLockScreenState extends State<VaultLockScreen> {
                           borderRadius: BorderRadius.circular(12),
                         ),
                       ),
-                      onPressed: _submit,
-                      child: Text(
-                        isFirstTime ? "Set Password" : "Unlock",
-                      ),
+                      onPressed: _unlocking ? null : _submit,
+                      child: _unlocking
+                          ? const SizedBox(
+                              height: 20,
+                              width: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : Text(
+                              isFirstTime ? "Set Password" : "Unlock",
+                            ),
                     ),
                   ),
 
