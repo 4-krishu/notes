@@ -58,7 +58,7 @@ class TrashItem {
 class VaultTrash {
   static const int keepDays = 30;
 
-  /// "<dir>/X.jpg.enc" -> "<dir>/X.jpg.thumb.enc"
+  /// `"<dir>/X.jpg.enc"` -> `"<dir>/X.jpg.thumb.enc"`
   static String thumbPathFor(String encPath) =>
       '${encPath.substring(0, encPath.length - '.enc'.length)}.thumb.enc';
 
