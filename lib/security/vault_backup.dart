@@ -25,10 +25,11 @@ class VaultBackup {
 
   /// Creates `vault_backup_<timestamp>.zip.enc` inside [targetDir].
   /// Returns the created file path. Throws on failure.
+  ///
+  /// [vaultKey] is the derived vault key (see VaultCrypto.deriveKey).
   static Future<String> exportBackup({
     required String vaultRoot,
-    required String password,
-    required String salt,
+    required Uint8List vaultKey,
     required String targetDir,
   }) async {
     final settings = Hive.box('settings');
@@ -66,8 +67,7 @@ class VaultBackup {
     final zipBytes = ZipEncoder().encode(archive);
     final encrypted = VaultCrypto.encryptBytes(
       Uint8List.fromList(zipBytes),
-      password,
-      salt,
+      vaultKey,
     );
 
     final out = File(
@@ -75,6 +75,28 @@ class VaultBackup {
     );
     await out.writeAsBytes(encrypted, flush: true);
     return out.path;
+  }
+
+  /// Decrypts a backup payload, accepting backups made before Phase B
+  /// (legacy single-SHA-256 key) as well as current ones.
+  /// Returns the zip bytes and whether the backup used the legacy key.
+  static ({Uint8List zipBytes, bool wasLegacy}) _decryptBackup(
+    Uint8List data,
+    String password,
+    String salt,
+  ) {
+    try {
+      return (
+        zipBytes: VaultCrypto.decryptBytes(
+            data, VaultCrypto.deriveKey(password, salt)),
+        wasLegacy: false
+      );
+    } catch (_) {}
+    return (
+      zipBytes: VaultCrypto.decryptBytes(
+          data, VaultCrypto.deriveKeyLegacy(password, salt)),
+      wasLegacy: true
+    );
   }
 
   /// Reads a backup file's manifest using [password]. Throws on a wrong
@@ -86,7 +108,7 @@ class VaultBackup {
   }) async {
     final data = await File(backupPath).readAsBytes();
     final zipBytes =
-        VaultCrypto.decryptBytes(data, password, salt);
+        _decryptBackup(data, password, salt).zipBytes;
     final archive = ZipDecoder().decodeBytes(zipBytes);
     for (final f in archive.files) {
       if (f.isFile && f.name == 'manifest.json') {
@@ -114,8 +136,8 @@ class VaultBackup {
     required String vaultRoot,
   }) async {
     final data = await File(backupPath).readAsBytes();
-    final zipBytes =
-        VaultCrypto.decryptBytes(data, password, salt);
+    final decrypted = _decryptBackup(data, password, salt);
+    final zipBytes = decrypted.zipBytes;
     final archive = ZipDecoder().decodeBytes(zipBytes);
 
     Map<String, dynamic>? manifest;
@@ -138,6 +160,10 @@ class VaultBackup {
 
     // Stage everything into a temp dir first; only swap when complete,
     // so a corrupt backup never leaves a half-written vault.
+    //
+    // If the backup was made before Phase B, its files are encrypted with
+    // the legacy key: re-encrypt them to the current key while staged, so
+    // the restored vault is fully on the new scheme.
     final staging =
         await Directory.systemTemp.createTemp('vault_restore_');
     try {
@@ -155,6 +181,16 @@ class VaultBackup {
         }
         await out.writeAsBytes(f.content as List<int>,
             flush: true);
+      }
+
+      if (decrypted.wasLegacy) {
+        // Entries were staged directly under staging.path ('vault/'
+        // was stripped when writing), so rekey the staging root itself.
+        await VaultCrypto.rekey(
+          vaultRoot: staging.path,
+          oldKey: VaultCrypto.deriveKeyLegacy(password, salt),
+          newKey: VaultCrypto.deriveKey(password, salt),
+        );
       }
 
       final root = Directory(vaultRoot);
