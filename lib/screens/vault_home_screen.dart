@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:hive/hive.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
 import '../security/vault_crypto.dart';
@@ -93,6 +94,9 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
     WidgetsBinding.instance.addObserver(this);
     _searchController.addListener(_onSearchChanged);
     _subscribeShake();
+    // Clean up plaintext temp copies left behind by document/video viewing
+    // (e.g. after an app kill). Runs once per vault open, fire and forget.
+    _sweepTempFiles();
     _refresh();
   }
 
@@ -167,6 +171,26 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
   }
 
   Future<String> _vaultRoot() => _storage.rootPath();
+
+  /// Deletes stale decrypted temp files (`vault_doc_*`, `vault_play_*`,
+  /// `vault_vthumb_*`) left in the temp dir by earlier sessions. These are
+  /// plaintext copies of vault content, so they must not linger.
+  Future<void> _sweepTempFiles() async {
+    try {
+      final tmp = await getTemporaryDirectory();
+      await for (final e in tmp.list()) {
+        if (e is! File) continue;
+        final name = e.path.split('/').last;
+        if (name.startsWith('vault_doc_') ||
+            name.startsWith('vault_play_') ||
+            name.startsWith('vault_vthumb_')) {
+          try {
+            await e.delete();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
 
   Future<void> _refresh() async {
     if (mounted) setState(() => loading = true);
